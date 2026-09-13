@@ -1,0 +1,70 @@
+# ============================================================
+#  Общий конфиг скрапера. Значения перечитываются на лету
+#  каждые ~5 сек — рестарт процесса/контейнера не нужен.
+# ============================================================
+
+# Список сабреддитов (без "r/"), которые опрашиваем.
+subreddits:
+  - AskReddit
+  - worldnews
+  - CryptoCurrency
+  - politics
+  - wallstreetbets
+  - todayilearned
+  - teenagers
+  - NoStupidQuestions
+  - BaldursGate3
+  - facepalm
+  - WhitePeopleTwitter
+  - AITAH
+  - gaming
+  - news
+  - AmItheAsshole
+  - TaylorSwift
+  - movies
+  - technology
+  - soccer
+  - unpopularopinion
+
+# Базовый URL Reddit. www.reddit.com — обычный сайт; можно попробовать
+# old.reddit.com — он легче и исторически имеет собственный (иногда более
+# мягкий) рейт-лимит, отдельный от www.
+reddit_base_url: "https://www.reddit.com"
+
+# Сколько комментариев запрашивать у Reddit за один запрос (на аккаунт).
+fetch_limit: 50
+
+# Целевой интервал опроса на аккаунт (сек). Реальный интервал каждый раз
+# случайно варьируется в пределах +-poll_jitter_ratio, чтобы не быть
+# идеально регулярным (это само по себе бот-сигнатура).
+poll_interval_seconds: 3
+poll_jitter_ratio: 0.25
+
+# ---- ГЛАВНЫЕ РУЧКИ ПОД ТВОЙ ПАЙПЛАЙН ----
+target_rate_per_second: 25
+max_age_seconds: 15
+# ------------------------------------------
+
+seen_cache_size: 1000
+
+store_endpoint: "http://127.0.0.1:9000/store_item"
+
+# Дефолтный User-Agent, если для конкретного аккаунта не задан свой
+# в accounts.yaml (см. там — у каждого аккаунта сейчас свой реалистичный UA).
+user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+
+request_timeout_seconds: 10
+token_wait_timeout_seconds: 0.5
+
+# ---- BACKOFF / RATE-LIMIT ЗАЩИТА ----
+# При 429 / 5xx / сетевых ошибках: экспоненциальный backoff
+# base_backoff_seconds * 2^(N подряд ошибок), но не больше max_backoff_seconds,
+# плюс случайный джиттер. Если Reddit прислал заголовок Retry-After —
+# используется он, если он больше расчётного backoff.
+base_backoff_seconds: 5
+max_backoff_seconds: 300
+
+# При 401/403 (протухшие cookies / бан) подряд — тот же backoff, но после
+# max_consecutive_auth_errors неудач подряд воркер этого аккаунта
+# останавливается совсем (не долбит дальше), пишет ERROR в лог.
+max_consecutive_auth_errors: 5

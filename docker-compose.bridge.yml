@@ -1,0 +1,44 @@
+# Альтернатива docker-compose.yml для Mac/Windows (Docker Desktop),
+# где network_mode: host не работает нативно как на Linux.
+#
+# Запуск:  docker compose -f docker-compose.bridge.yml up -d --build
+
+services:
+  mihomo:
+    image: metacubex/mihomo:latest
+    container_name: reddit_scraper_mihomo
+    restart: unless-stopped
+    volumes:
+      - ./mihomo_config.yaml:/root/.config/mihomo/config.yaml:ro
+    command: ["-d", "/root/.config/mihomo"]
+    networks:
+      - scraper_net
+
+  scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: reddit_scraper_app
+    restart: unless-stopped
+    depends_on:
+      - mihomo
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./accounts.yaml:/app/accounts.yaml:ro
+      - ./cookies:/app/cookies:ro
+    environment:
+      - CONFIG_PATH=/app/config.yaml
+      - ACCOUNTS_PATH=/app/accounts.yaml
+      # "mihomo" — DNS-имя соседнего контейнера в этой же docker-сети
+      - PROXY_HOST=mihomo
+      # пайплайн (store_item) слушает на хосте, а не в докере —
+      # host.docker.internal указывает наружу, на хост-машину
+      - STORE_ENDPOINT=http://host.docker.internal:9000/store_item
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - scraper_net
+
+networks:
+  scraper_net:
+    driver: bridge

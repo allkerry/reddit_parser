@@ -1,0 +1,40 @@
+# ============================================================
+#  network_mode: host — самый простой вариант и он же нужен по смыслу:
+#  scraper должен видеть локальные прокси-порты mihomo (127.0.0.1:7891-7896)
+#  И локальный пайплайн на хосте (127.0.0.1:9000/store_item) без лишней
+#  настройки docker-сетей.
+#
+#  РАБОТАЕТ "из коробки" ТОЛЬКО НА LINUX. На Mac/Windows (Docker Desktop)
+#  host-сеть не поддерживается так же нативно — смотри блок
+#  "bridge-вариант для Mac/Windows" в README.md.
+# ============================================================
+
+services:
+  mihomo:
+    image: metacubex/mihomo:latest
+    container_name: reddit_scraper_mihomo
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./mihomo_config.yaml:/root/.config/mihomo/config.yaml:ro
+    command: ["-d", "/root/.config/mihomo"]
+
+  scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: reddit_scraper_app
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - mihomo
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./accounts.yaml:/app/accounts.yaml:ro
+      - ./cookies:/app/cookies:ro
+    environment:
+      - CONFIG_PATH=/app/config.yaml
+      - ACCOUNTS_PATH=/app/accounts.yaml
+      - PROXY_HOST=127.0.0.1
+      # Раскомментируй и поправь, если пайплайн слушает не на localhost хоста:
+      # - STORE_ENDPOINT=http://127.0.0.1:9000/store_item

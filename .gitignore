@@ -1,0 +1,4 @@
+cookies/*.json
+__pycache__/
+*.pyc
+mihomo_config.yaml
