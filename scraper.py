@@ -24,6 +24,13 @@ Reddit fresh-comments scraper -> POST /store_items (batch)
   по-прежнему берутся по одному на айтем (это и есть общий rate-limit),
   но фактическая отправка по сети идёт одним запросом на цикл на аккаунт.
 - config.yaml перечитывается на лету каждые CONFIG_RELOAD_SECONDS секунд.
+
+Дедуп (SeenCache) — двухфазный (claim/confirm/release), НЕ атомарный
+seen_or_mark: id помечается окончательно "виденным" только после
+подтверждённой успешной отправки в store_items. Если батч целиком
+упал (5xx/413/timeout/ClientError), claim снимается через release() —
+элемент снова видим и может уйти в следующем цикле опроса, вместо
+того чтобы быть молча и навсегда потерянным.
 """
 
 import asyncio
@@ -137,25 +144,53 @@ class TokenBucket:
 
 
 # ---------------------------------------------------------------- #
-#  Общий дедуп-кэш
+#  Общий дедуп-кэш (двухфазный: claim -> confirm/release)
 # ---------------------------------------------------------------- #
 
 class SeenCache:
+    """id считается окончательно "виденным" (и попадает в LRU-множество
+    `_set`, которое реально защищает от повторной отправки в будущих
+    циклах) только после confirm(). До этого он лежит в `_pending` —
+    это чисто внутрипроцессная защита от одновременной попытки отправить
+    один и тот же id дважды параллельно, а не постоянный дедуп-статус.
+
+    Если отправка не удалась (или не дали токен) — вызывается release(),
+    id снимается из `_pending` и становится снова "невиденным": в
+    следующем цикле опроса (пока комментарий не вышел за max_age_seconds)
+    он будет заново подхвачен и отправлен."""
+
     def __init__(self, max_size: int):
         self._deque = deque(maxlen=max_size)
         self._set = set()
+        self._pending = set()
         self._lock = asyncio.Lock()
 
-    async def seen_or_mark(self, item_id: str) -> bool:
+    async def try_claim(self, item_id: str) -> bool:
+        """True — элемент свободен, можно готовить к отправке (заявлен).
+        False — уже подтверждённый дубль или прямо сейчас отправляется
+        другим воркером — пропускаем."""
         async with self._lock:
-            if item_id in self._set:
-                return True
-            if len(self._deque) == self._deque.maxlen:
-                old = self._deque.popleft()
-                self._set.discard(old)
-            self._deque.append(item_id)
-            self._set.add(item_id)
-            return False
+            if item_id in self._set or item_id in self._pending:
+                return False
+            self._pending.add(item_id)
+            return True
+
+    async def confirm(self, item_id: str):
+        """Отправка подтверждённо успешна: pending -> постоянно seen."""
+        async with self._lock:
+            self._pending.discard(item_id)
+            if item_id not in self._set:
+                if len(self._deque) == self._deque.maxlen:
+                    old = self._deque.popleft()
+                    self._set.discard(old)
+                self._deque.append(item_id)
+                self._set.add(item_id)
+
+    async def release(self, item_id: str):
+        """Отправка не удалась (или токен не выдан вовремя): снимаем
+        claim, элемент снова доступен для следующей попытки."""
+        async with self._lock:
+            self._pending.discard(item_id)
 
 
 # ---------------------------------------------------------------- #
@@ -312,7 +347,7 @@ async def fetch_comments(
 
 def _item_ok(entry) -> bool:
     """Разбирает один элемент results[] из ответа /store_items.
-    Формат отдельного результата coллектором явно не специфицирован,
+    Формат отдельного результата коллектором явно не специфицирован,
     поэтому распознаём несколько разумных вариантов и по умолчанию
     считаем успехом, если явного признака ошибки нет."""
     if isinstance(entry, bool):
@@ -337,7 +372,9 @@ async def send_batch_to_store(
 ) -> list[bool]:
     """Отправляет items одним (или несколькими, если батч больше лимита)
     POST-запросом(и) на /store_items. Возвращает список bool — по одному
-    на исходный items[i], в том же порядке."""
+    на исходный items[i], в том же порядке. False для элемента означает
+    "не подтверждён как сохранённый" — вызывающий код обязан вызвать
+    seen.release() для таких элементов, а не считать их отправленными."""
     if not items:
         return []
 
@@ -389,6 +426,9 @@ async def send_batch_to_store(
 
         except aiohttp.ClientError as e:
             log.warning("[%s] Ошибка отправки батча в store_items (%s): %s", account_name, endpoint, e)
+            results.extend([False] * len(chunk))
+        except asyncio.TimeoutError:
+            log.warning("[%s] Таймаут отправки батча в store_items (%s)", account_name, endpoint)
             results.extend([False] * len(chunk))
 
     return results
@@ -502,16 +542,20 @@ async def account_worker(
 
             payloads.sort(key=lambda p: p["_age_seconds"])
 
-            # ---- дедуп + rate-limit токены (по одному на айтем), затем один батч-POST ----
+            # ---- дедуп (двухфазный claim) + rate-limit токены, затем батч-POST ----
             to_send: list[dict] = []
             dropped_dup = dropped_rate = 0
             for p in payloads:
-                if await seen.seen_or_mark(p["external_id"]):
+                if not await seen.try_claim(p["external_id"]):
                     dropped_dup += 1
                     continue
 
                 got_token = await _acquire_with_retry(bucket, token_wait_timeout)
                 if not got_token:
+                    # Токена не дождались — снимаем claim, иначе элемент
+                    # навсегда "потеряется" как псевдо-дубль, хотя мы его
+                    # так и не отправили.
+                    await seen.release(p["external_id"])
                     dropped_rate += 1
                     continue
 
@@ -524,17 +568,28 @@ async def account_worker(
                 )
                 for p, ok in zip(to_send, ok_flags):
                     if ok:
+                        # Подтверждено сервером (или как минимум 2xx на
+                        # весь батч) -> окончательно помечаем seen.
+                        await seen.confirm(p["external_id"])
                         sent += 1
                         log.info(
                             "[%s] OK  %-12s age=%.1fs  %s",
                             name, p["external_id"], p["_age_seconds"],
                             p["content"][:60].replace("\n", " "),
                         )
+                    else:
+                        # Батч (или конкретный айтем) не подтверждён —
+                        # освобождаем claim, чтобы он не считался дублем
+                        # в следующем цикле опроса и мог уйти повторно.
+                        await seen.release(p["external_id"])
 
             if sent or dropped_rate or to_send:
+                not_confirmed = len(to_send) - sent
                 log.info(
-                    "[%s] цикл: получено=%d свежих=%d к_отправке=%d отправлено=%d дублей=%d срезано_лимитом=%d",
-                    name, len(comments), len(payloads), len(to_send), sent, dropped_dup, dropped_rate,
+                    "[%s] цикл: получено=%d свежих=%d к_отправке=%d отправлено=%d "
+                    "не_подтверждено=%d дублей=%d срезано_лимитом=%d",
+                    name, len(comments), len(payloads), len(to_send), sent,
+                    not_confirmed, dropped_dup, dropped_rate,
                 )
 
             elapsed = time.monotonic() - cycle_start
