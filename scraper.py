@@ -35,6 +35,7 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
+from curl_cffi import requests as cffi_requests
 
 import aiohttp
 import yaml
@@ -270,26 +271,37 @@ async def fetch_comments(
 ) -> FetchResult:
     url = f"{base_url}/r/{subs_joined}/comments.json"
     params = {"limit": fetch_limit}
-    try:
-        async with session.get(
-            url, params=params, proxy=proxy_url, timeout=aiohttp.ClientTimeout(total=timeout)
-        ) as resp:
-            if resp.status == 429:
-                retry_after = parse_retry_after(resp)
-                return FetchResult(status=429, retry_after=retry_after, error_kind="rate_or_server")
-            if resp.status in (401, 403):
-                return FetchResult(status=resp.status, error_kind="auth")
-            if resp.status >= 500:
-                return FetchResult(status=resp.status, error_kind="rate_or_server")
-            if resp.status != 200:
-                log.warning("[%s] Reddit вернул неожиданный статус %s", account_name, resp.status)
-                return FetchResult(status=resp.status, error_kind="rate_or_server")
 
-            data = await resp.json(content_type=None)
-    except asyncio.TimeoutError:
-        log.warning("[%s] Таймаут запроса к Reddit", account_name)
-        return FetchResult(error_kind="network")
-    except aiohttp.ClientError as e:
+    # curl_cffi не умеет работать с aiohttp.ClientSession, поэтому cookies
+    # вытаскиваем из неё вручную и передаём явно.
+    cookies = {c.key: c.value for c in session.cookie_jar}
+
+    try:
+        resp = await asyncio.to_thread(
+            cffi_requests.get,
+            url,
+            impersonate="chrome",
+            params=params,
+            proxies={"http": proxy_url, "https": proxy_url} if proxy_url else None,
+            cookies=cookies,
+            timeout=timeout,
+            allow_redirects=True,
+        )
+
+        if resp.status_code == 429:
+            retry_after = parse_retry_after(resp)
+            return FetchResult(status=429, retry_after=retry_after, error_kind="rate_or_server")
+        if resp.status_code in (401, 403):
+            return FetchResult(status=resp.status_code, error_kind="auth")
+        if resp.status_code >= 500:
+            return FetchResult(status=resp.status_code, error_kind="rate_or_server")
+        if resp.status_code != 200:
+            log.warning("[%s] Reddit вернул неожиданный статус %s", account_name, resp.status_code)
+            return FetchResult(status=resp.status_code, error_kind="rate_or_server")
+
+        data = resp.json()
+
+    except (asyncio.TimeoutError, cffi_requests.RequestsError) as e:
         log.warning("[%s] Ошибка запроса к Reddit (проверь mihomo/порт): %s", account_name, e)
         return FetchResult(error_kind="network")
 
