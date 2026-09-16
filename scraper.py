@@ -24,6 +24,9 @@ Reddit fresh-comments scraper -> POST /store_items (batch)
   по-прежнему берутся по одному на айтем (это и есть общий rate-limit),
   но фактическая отправка по сети идёт одним запросом на цикл на аккаунт.
 - config.yaml перечитывается на лету каждые CONFIG_RELOAD_SECONDS секунд.
+- curl_cffi (синхронный, блокирующий) выполняется в ВЫДЕЛЕННОМ
+  ThreadPoolExecutor размером ровно под число аккаунтов (см. "Блокирующие
+  вызовы" ниже), а не в дефолтном shared-пуле asyncio.to_thread.
 
 Дедуп (SeenCache) — двухфазный (claim/confirm/release), НЕ атомарный
 seen_or_mark: id помечается окончательно "виденным" только после
@@ -31,15 +34,47 @@ seen_or_mark: id помечается окончательно "виденным
 упал (5xx/413/timeout/ClientError), claim снимается через release() —
 элемент снова видим и может уйти в следующем цикле опроса, вместо
 того чтобы быть молча и навсегда потерянным.
+
+Блокирующие вызовы (curl_cffi) и пул потоков
+---------------------------------------------
+curl_cffi — синхронная библиотека, поэтому её вызов из asyncio-кода
+обязан уходить в отдельный поток. По умолчанию `asyncio.to_thread()`
+берёт поток из процесс-wide дефолтного executor'а (`min(32, cpu_count+4)`
+потоков), который никак не связан с числом наших аккаунтов и может
+шариться с чем угодно ещё в процессе.
+
+Проблема: если прокси-нода подвисает (или зависает DNS-резолвинг —
+таймаут `timeout=` у curl не всегда успевает его перехватить), поток
+блокируется дольше ожидаемого. При достаточном числе таких зависаний
+дефолтный пул может исчерпаться, и новые запросы (в т.ч. от аккаунтов,
+у которых прокси в порядке) начнут молча ждать в очереди executor'а —
+без единой ошибки в логах, просто зависшие циклы.
+
+Решение здесь:
+1. Собственный `ThreadPoolExecutor` (`http_executor`), создаётся в
+   `main()` с `max_workers = len(accounts)` (по одному гарантированному
+   потоку на воркер) — все обращения к нему явные
+   (`loop.run_in_executor(http_executor, ...)`), никогда не через
+   `asyncio.to_thread`. Один зависший аккаунт физически не может отнять
+   поток у другого.
+2. Вызов дополнительно обёрнут в `asyncio.wait_for(..., timeout + запас)`
+   — это подстраховка на случай, если `timeout=` внутри curl_cffi не
+   сработает как ожидается (например, DNS-хендшейк вне таймаута
+   запроса): цикл воркера всё равно разблокируется и уйдёт в обычный
+   backoff, вместо того чтобы виснуть бесконечно. Сам поток при этом
+   может доработать в фоне и корректно освободиться сам — это не
+   "убивает" запрос, а лишь не даёт ему держать asyncio-цикл воркера.
 """
 
 import asyncio
+import functools
 import json
 import logging
 import os
 import random
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from curl_cffi import requests as cffi_requests
@@ -59,6 +94,11 @@ CONFIG_RELOAD_SECONDS = float(os.environ.get("CONFIG_RELOAD_SECONDS", "5"))
 # отклоняет пачки больше BATCH_MAX_ITEMS с 413). Наш batch_max_items из
 # config.yaml обрезается этим значением на всякий случай.
 SERVER_HARD_BATCH_LIMIT = 1000
+
+# Сколько секунд сверх HTTP-таймаута ждать поток curl_cffi, прежде чем
+# считать вызов зависшим и разблокировать цикл воркера принудительно
+# (см. "Блокирующие вызовы" в шапке файла).
+HTTP_EXECUTOR_SLACK_SECONDS = 5
 
 logging.basicConfig(
     level=logging.INFO,
@@ -303,6 +343,7 @@ async def fetch_comments(
     proxy_url: str,
     timeout: int,
     account_name: str,
+    http_executor: ThreadPoolExecutor,
 ) -> FetchResult:
     url = f"{base_url}/r/{subs_joined}/comments.json"
     params = {"limit": fetch_limit}
@@ -311,16 +352,27 @@ async def fetch_comments(
     # вытаскиваем из неё вручную и передаём явно.
     cookies = {c.key: c.value for c in session.cookie_jar}
 
+    call = functools.partial(
+        cffi_requests.get,
+        url,
+        impersonate="chrome",
+        params=params,
+        proxies={"http": proxy_url, "https": proxy_url} if proxy_url else None,
+        cookies=cookies,
+        timeout=timeout,
+        allow_redirects=True,
+    )
+
     try:
-        resp = await asyncio.to_thread(
-            cffi_requests.get,
-            url,
-            impersonate="chrome",
-            params=params,
-            proxies={"http": proxy_url, "https": proxy_url} if proxy_url else None,
-            cookies=cookies,
-            timeout=timeout,
-            allow_redirects=True,
+        loop = asyncio.get_running_loop()
+        # Выделенный пул (см. шапку файла) вместо дефолтного shared-executor'а
+        # asyncio.to_thread: гарантированный поток на аккаунт, зависшая
+        # прокси одного аккаунта не съедает пул у остальных.
+        # wait_for — подстраховка сверх HTTP-таймаута curl_cffi на случай,
+        # если сам curl не среагировал на timeout= вовремя (напр. DNS).
+        resp = await asyncio.wait_for(
+            loop.run_in_executor(http_executor, call),
+            timeout=timeout + HTTP_EXECUTOR_SLACK_SECONDS,
         )
 
         if resp.status_code == 429:
@@ -336,7 +388,16 @@ async def fetch_comments(
 
         data = resp.json()
 
-    except (asyncio.TimeoutError, cffi_requests.RequestsError) as e:
+    except asyncio.TimeoutError:
+        # Поток мог не успеть за timeout + slack — цикл воркера всё равно
+        # разблокируется и уходит в обычный network-backoff; сам поток
+        # curl_cffi доработает и освободится в фоне самостоятельно.
+        log.warning(
+            "[%s] Запрос к Reddit не уложился в %.0fs (timeout+запас) — проверь mihomo/порт",
+            account_name, timeout + HTTP_EXECUTOR_SLACK_SECONDS,
+        )
+        return FetchResult(error_kind="network")
+    except cffi_requests.RequestsError as e:
         log.warning("[%s] Ошибка запроса к Reddit (проверь mihomo/порт): %s", account_name, e)
         return FetchResult(error_kind="network")
 
@@ -441,6 +502,7 @@ async def account_worker(
     seen: SeenCache,
     phase_offset: float,
     store_session: aiohttp.ClientSession,
+    http_executor: ThreadPoolExecutor,
 ):
     name = account["name"]
     cookie_file = BASE_DIR / account["cookie_file"]
@@ -492,7 +554,9 @@ async def account_worker(
                 await asyncio.sleep(poll_interval)
                 continue
 
-            result = await fetch_comments(session, base_url, subs_joined, fetch_limit, proxy_url, timeout, name)
+            result = await fetch_comments(
+                session, base_url, subs_joined, fetch_limit, proxy_url, timeout, name, http_executor
+            )
 
             # ---- обработка ошибок / backoff ----
             if result.error_kind == "rate_or_server":
@@ -632,16 +696,32 @@ async def main():
     bucket = TokenBucket(config.get("target_rate_per_second", 25))
     seen = SeenCache(config.get("seen_cache_size", 1000))
 
-    async with aiohttp.ClientSession() as store_session:
-        tasks = [asyncio.create_task(config.reload_loop())]
-        for i, account in enumerate(accounts):
-            phase_offset = i * (config.get("poll_interval_seconds", 3) / len(accounts))
-            tasks.append(
-                asyncio.create_task(
-                    account_worker(account, config, bucket, seen, phase_offset, store_session)
+    # Выделенный пул потоков под блокирующие curl_cffi-вызовы — ровно по
+    # одному гарантированному потоку на каждый воркер-аккаунт, отдельно
+    # от дефолтного shared-executor'а asyncio.to_thread (см. шапку файла).
+    http_executor = ThreadPoolExecutor(
+        max_workers=len(accounts),
+        thread_name_prefix="reddit-fetch",
+    )
+
+    try:
+        async with aiohttp.ClientSession() as store_session:
+            tasks = [asyncio.create_task(config.reload_loop())]
+            for i, account in enumerate(accounts):
+                phase_offset = i * (config.get("poll_interval_seconds", 3) / len(accounts))
+                tasks.append(
+                    asyncio.create_task(
+                        account_worker(
+                            account, config, bucket, seen, phase_offset, store_session, http_executor
+                        )
+                    )
                 )
-            )
-        await asyncio.gather(*tasks)
+            await asyncio.gather(*tasks)
+    finally:
+        # wait=False: не блокируем shutdown процесса зависшими потоками —
+        # они либо доработают в фоне интерпретатора, либо умрут вместе с
+        # процессом при завершении.
+        http_executor.shutdown(wait=False, cancel_futures=True)
 
 
 if __name__ == "__main__":
