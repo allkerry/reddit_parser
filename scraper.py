@@ -673,7 +673,22 @@ async def send_batch_to_store(
                     results.extend([False] * len(chunk))
                     continue
 
-                data = await resp.json(content_type=None)
+                try:
+                    data = await resp.json(content_type=None)
+                except (json.JSONDecodeError, ValueError) as e:
+                    # 2xx, но тело не распарсилось как JSON (например,
+                    # прокси/балансировщик перед store_endpoint подменил
+                    # тело ответа). Раз сервер не подтвердил сохранение
+                    # поэлементно — считаем весь чанк неподтверждённым,
+                    # а не роняем воркер необработанным исключением: он
+                    # уйдёт по обычному пути seen.release() и повторной
+                    # отправки в следующем цикле опроса.
+                    log.warning(
+                        "[%s] store_items вернул %s, но тело не распарсилось как JSON: %s",
+                        account_name, resp.status, e,
+                    )
+                    results.extend([False] * len(chunk))
+                    continue
                 item_results = data.get("results") if isinstance(data, dict) else None
 
                 if isinstance(item_results, list) and len(item_results) == len(chunk):
@@ -1031,7 +1046,18 @@ async def main():
     )
 
     try:
-        async with aiohttp.ClientSession() as store_session:
+        # Явный коннектор вместо дефолтного: store_session живёт весь аптайм
+        # процесса (main() не пересоздаёт её), поэтому важно не полагаться
+        # молча на дефолтный ttl_dns_cache aiohttp, а зафиксировать TTL явно
+        # прямо в коде — если у store_endpoint сменится IP (например,
+        # при переподъёме принимающего сервера), запись обновится не позже
+        # чем через ttl_dns_cache секунд, а не будет висеть в кэше
+        # неограниченно долго. keepalive_timeout ограничивает время жизни
+        # уже установленных TCP-соединений к старому IP — иначе даже после
+        # обновления DNS-кэша, активное keep-alive-соединение к устаревшему
+        # адресу могло бы продолжать использоваться сколь угодно долго.
+        store_connector = aiohttp.TCPConnector(ttl_dns_cache=300, keepalive_timeout=60)
+        async with aiohttp.ClientSession(connector=store_connector) as store_session:
             tasks = [asyncio.create_task(config.reload_loop())]
             for i, account in enumerate(accounts):
                 phase_offset = i * (config.get("poll_interval_seconds", 3) / len(accounts))
