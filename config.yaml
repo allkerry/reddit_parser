@@ -25,6 +25,15 @@ subreddits:
   - technology
   - soccer
   - unpopularopinion
+  - antiwork
+  - Damnthatsinteresting
+  - AskUK
+  - de
+  - FreeKarma4All
+  - mildlyinfuriating
+  - relationship_advice
+  - europe
+  - pics
 
 # Базовый URL Reddit. www.reddit.com — обычный сайт; можно попробовать
 # old.reddit.com — он легче и исторически имеет собственный (иногда более
@@ -32,7 +41,7 @@ subreddits:
 reddit_base_url: "https://www.reddit.com"
 
 # Сколько комментариев запрашивать у Reddit за один запрос (на аккаунт).
-fetch_limit: 50
+fetch_limit: 100
 
 # Целевой интервал опроса на аккаунт (сек). Реальный интервал каждый раз
 # случайно варьируется в пределах +-poll_jitter_ratio, чтобы не быть
@@ -42,7 +51,7 @@ poll_jitter_ratio: 0.25
 
 # ---- ГЛАВНЫЕ РУЧКИ ПОД ТВОЙ ПАЙПЛАЙН ----
 target_rate_per_second: 25
-max_age_seconds: 15
+max_age_seconds: 100
 # ------------------------------------------
 
 seen_cache_size: 1000
@@ -61,7 +70,17 @@ batch_max_items: 500
 # в accounts.yaml (см. там — у каждого аккаунта сейчас свой реалистичный UA).
 user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
+# request_timeout_seconds — read-таймаут: сколько ждать тело ответа
+# ПОСЛЕ того, как соединение уже установлено.
+# connect_timeout_seconds — отдельный (обычно меньший) таймаут на
+# DNS-резолвинг + TCP/TLS-хендшейк. Раньше в curl_cffi передавался один
+# общий timeout=, из-за чего зависший DNS/хендшейк мог не перехватываться
+# вовремя и держать поток в http_executor заблокированным дольше
+# ожидаемого (см. комментарии в scraper.py, "Блокирующие вызовы").
+# Держим меньше request_timeout_seconds: если TCP/TLS не поднялся за
+# 5с — дальше ждать смысла нет, это не про медленный ответ сервера.
 request_timeout_seconds: 10
+connect_timeout_seconds: 5
 token_wait_timeout_seconds: 0.5
 
 # ---- BACKOFF / RATE-LIMIT ЗАЩИТА ----
@@ -76,3 +95,6 @@ max_backoff_seconds: 300
 # max_consecutive_auth_errors неудач подряд воркер этого аккаунта
 # останавливается совсем (не долбит дальше), пишет ERROR в лог.
 max_consecutive_auth_errors: 5
+
+# Максимальное количество страниц, выкачиваемых за один цикл опроса
+pagination_max_pages: 5

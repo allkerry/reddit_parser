@@ -1,45 +1,42 @@
-# ============================================================
-#  Список аккаунтов. Каждый аккаунт = свои cookies + свой
-#  локальный прокси-порт (mihomo) + свой User-Agent.
-#
-#  Разные UA на разных аккаунтах — специально: так они меньше
-#  похожи друг на друга и на типовой "скриптовый" трафик.
-#  enabled: false -> аккаунт полностью игнорируется скраппером.
-# ============================================================
-
 accounts:
   - name: account_1
     enabled: true
     cookie_file: cookies/account_1.json
     proxy_port: 7891
-    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    impersonate: chrome131
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
   - name: account_2
     enabled: false
     cookie_file: cookies/account_2.json
     proxy_port: 7892
-    user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15"
+    impersonate: safari180
+    user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
 
   - name: account_3
     enabled: false
     cookie_file: cookies/account_3.json
     proxy_port: 7893
-    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0"
+    impersonate: firefox133
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0"
 
   - name: account_4
     enabled: false
     cookie_file: cookies/account_4.json
     proxy_port: 7894
-    user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+    impersonate: chrome124
+    user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
   - name: account_5
     enabled: false
     cookie_file: cookies/account_5.json
     proxy_port: 7895
-    user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+    impersonate: chrome136
+    user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 
   - name: account_6
     enabled: false
     cookie_file: cookies/account_6.json
     proxy_port: 7896
-    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+    impersonate: chrome145
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"

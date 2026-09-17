@@ -11,7 +11,7 @@ Reddit fresh-comments scraper -> POST /store_items (batch)
   блокировку).
 - Джиттер (+-poll_jitter_ratio) на обычный интервал опроса — паттерн
   запросов не идеально ровный, как у типичного бота.
-- Реалистичный User-Agent на каждый аккаунт (задаётся в accounts.yaml),
+- Реалистичные User-Agent на каждый аккаунт (задаётся в accounts.yaml),
   вместо самопального "python:...", который прямо выдаёт скрипт.
 - При повторяющихся 401/403 (протухшие/забаненные cookies) — воркер
   аккаунта останавливается после max_consecutive_auth_errors подряд
@@ -27,6 +27,29 @@ Reddit fresh-comments scraper -> POST /store_items (batch)
 - curl_cffi (синхронный, блокирующий) выполняется в ВЫДЕЛЕННОМ
   ThreadPoolExecutor размером ровно под число аккаунтов (см. "Блокирующие
   вызовы" ниже), а не в дефолтном shared-пуле asyncio.to_thread.
+
+Пагинация fetch-запроса
+------------------------
+Один запрос к .../comments.json отдаёт максимум `fetch_limit` комментариев,
+отсортированных от новых к старым. Если ПОСЛЕДНИЙ (самый старый) комментарий
+в полученной странице всё ещё не старше `max_age_seconds` — значит за это
+окно свежих комментариев могло быть больше, чем `fetch_limit`, и часть
+осталась не забрана. В этом случае `fetch_comments()` сама тянет следующую
+страницу через параметр `after` (значение поля "after" из ответа Reddit,
+либо fullname последнего элемента страницы как fallback) и объединяет
+результаты. Пагинация одного цикла опроса аккаунта останавливается, как
+только:
+  - последний комментарий очередной страницы старше max_age_seconds
+    (дальше в листинге только ещё более старые — они и так не пройдут
+    фильтр по возрасту ниже, в account_worker), либо
+  - страница пустая или Reddit не вернул `after` (дальше данных нет), либо
+  - достигнут потолок `pagination_max_pages` из config.yaml — защита от
+    неограниченного числа запросов за один цикл опроса при аномально
+    высоком трафике саба.
+Ошибка (429/5xx/401/403/сеть) на любой странице прерывает пагинацию и
+уходит по тому же backoff-пути, что и раньше; уже накопленные в рамках
+этого цикла страницы отбрасываются — потери нет, они не были подтверждены
+в SeenCache и будут заново подхвачены в следующем цикле опроса.
 
 Дедуп (SeenCache) — двухфазный (claim/confirm/release), НЕ атомарный
 seen_or_mark: id помечается окончательно "виденным" только после
@@ -50,20 +73,39 @@ curl_cffi — синхронная библиотека, поэтому её в�
 у которых прокси в порядке) начнут молча ждать в очереди executor'а —
 без единой ошибки в логах, просто зависшие циклы.
 
+Проблема (уточнение): `asyncio.wait_for(...)` при срабатывании таймаута
+отменяет только asyncio-задачу, обёрнутую вокруг `run_in_executor` —
+сам поток в `ThreadPoolExecutor` при этом НЕ прерывается принудительно
+(Python не умеет убивать потоки снаружи). Если сокет или DNS-резолвинг
+внутри `curl_cffi` завис, поток остаётся заблокированным на неопределённое
+время. При `max_workers = len(accounts)` это означает, что зависшая
+прокси одного аккаунта перманентно отнимает у пула ровно один поток —
+свободных потоков в запасе нет. На следующем цикле опроса ЭТОГО ЖЕ
+воркера (или в худшем случае — при накоплении нескольких таких
+зависаний от разных аккаунтов) новый `run_in_executor` встаёт в очередь
+executor'а и ждёт освобождения потока бесконечно, т.к. освободиться
+ему неоткуда.
+
 Решение здесь:
-1. Собственный `ThreadPoolExecutor` (`http_executor`), создаётся в
-   `main()` с `max_workers = len(accounts)` (по одному гарантированному
-   потоку на воркер) — все обращения к нему явные
-   (`loop.run_in_executor(http_executor, ...)`), никогда не через
-   `asyncio.to_thread`. Один зависший аккаунт физически не может отнять
-   поток у другого.
-2. Вызов дополнительно обёрнут в `asyncio.wait_for(..., timeout + запас)`
-   — это подстраховка на случай, если `timeout=` внутри curl_cffi не
-   сработает как ожидается (например, DNS-хендшейк вне таймаута
-   запроса): цикл воркера всё равно разблокируется и уйдёт в обычный
-   backoff, вместо того чтобы виснуть бесконечно. Сам поток при этом
-   может доработать в фоне и корректно освободиться сам — это не
-   "убивает" запрос, а лишь не даёт ему держать asyncio-цикл воркера.
+1. Пул потоков создаётся с запасом, а не впритык по числу аккаунтов:
+   `max_workers = max(32, len(accounts) * 2)`. Даже если у части
+   аккаунтов потоки зависли навсегда, у остальных остаются свободные
+   потоки про запас, и пул не вырождается в блокировку по цепочке.
+   Это не устраняет утечку потока при зависании (см. выше — снаружи
+   поток всё равно не убить), а даёт пулу достаточный запас, чтобы
+   утечка отдельных потоков не останавливала весь сервис.
+2. `curl_cffi` вызывается с явными сокет-таймаутами, а не только с
+   общим `timeout=`: `timeout=(connect_timeout, read_timeout)` —
+   отдельно `connect_timeout_seconds` (обычно должен успевать
+   перехватить зависший DNS/handshake) и `read_timeout_seconds` (общий
+   `request_timeout_seconds` из config.yaml). Это снижает вероятность
+   самого зависания на уровне curl, а не только компенсирует её постфактум.
+3. Вызов дополнительно обёрнут в `asyncio.wait_for(..., connect+read+запас)`
+   — подстраховка на случай, если сокет-таймауты curl_cffi всё равно не
+   сработают как ожидается: цикл воркера в любом случае разблокируется и
+   уйдёт в обычный backoff, вместо того чтобы виснуть бесконечно. Сам
+   поток при этом может доработать в фоне и корректно освободиться сам —
+   это не "убивает" запрос, а лишь не даёт ему держать asyncio-цикл воркера.
 """
 
 import asyncio
@@ -95,10 +137,16 @@ CONFIG_RELOAD_SECONDS = float(os.environ.get("CONFIG_RELOAD_SECONDS", "5"))
 # config.yaml обрезается этим значением на всякий случай.
 SERVER_HARD_BATCH_LIMIT = 1000
 
-# Сколько секунд сверх HTTP-таймаута ждать поток curl_cffi, прежде чем
-# считать вызов зависшим и разблокировать цикл воркера принудительно
-# (см. "Блокирующие вызовы" в шапке файла).
+# Сколько секунд сверх HTTP-таймаута (connect + read) ждать поток
+# curl_cffi, прежде чем считать вызов зависшим и разблокировать цикл
+# воркера принудительно (см. "Блокирующие вызовы" в шапке файла).
 HTTP_EXECUTOR_SLACK_SECONDS = 5
+
+# Дефолтный connect-таймаут curl_cffi, если connect_timeout_seconds не
+# задан в config.yaml. Держим его меньше read-таймаута: зависший
+# DNS/TCP/TLS-хендшейк обычно должен отваливаться быстрее, чем ожидание
+# тела ответа на уже установленном соединении.
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 5
 
 logging.basicConfig(
     level=logging.INFO,
@@ -320,20 +368,180 @@ def parse_retry_after(resp: aiohttp.ClientResponse) -> float | None:
         return None
 
 
+def parse_ratelimit_headers(resp) -> dict | None:
+    """Разбирает X-Ratelimit-Remaining / X-Ratelimit-Reset (и опционально
+    X-Ratelimit-Used) из ответа Reddit. Обычно приходят все вместе; если
+    сервер их не прислал (эндпоинт/CDN не отдаёт телеметрию) — возвращаем
+    None, и адаптация по заголовкам просто не включается для этого
+    ответа (используется statичный poll_interval из config.yaml)."""
+    try:
+        remaining = resp.headers.get("X-Ratelimit-Remaining") or resp.headers.get("x-ratelimit-remaining")
+        reset = resp.headers.get("X-Ratelimit-Reset") or resp.headers.get("x-ratelimit-reset")
+        used = resp.headers.get("X-Ratelimit-Used") or resp.headers.get("x-ratelimit-used")
+        if remaining is None or reset is None:
+            return None
+        return {
+            "remaining": float(remaining),
+            "reset": float(reset),
+            "used": float(used) if used is not None else None,
+        }
+    except (TypeError, ValueError):
+        return None
+
+
 # ---------------------------------------------------------------- #
 #  Один аккаунт = один воркер
 # ---------------------------------------------------------------- #
 
 class FetchResult:
-    __slots__ = ("comments", "status", "retry_after", "error_kind")
+    __slots__ = ("comments", "status", "retry_after", "error_kind", "after",
+                 "pages_fetched", "ratelimit")
 
-    def __init__(self, comments=None, status=None, retry_after=None, error_kind=None):
+    def __init__(self, comments=None, status=None, retry_after=None, error_kind=None,
+                 after=None, pages_fetched=1, ratelimit=None):
         self.comments = comments or []
         self.status = status
         self.retry_after = retry_after
         # error_kind: None | "rate_or_server" | "auth" | "network"
         self.error_kind = error_kind
+        # Курсор пагинации Reddit ("after" из ответа листинга, либо
+        # fullname последнего элемента как fallback) — None, если больше
+        # страниц нет / страница пустая.
+        self.after = after
+        # Сколько страниц реально было выкачано за этот fetch_comments()
+        # (используется в account_worker для adjusted_interval). По
+        # умолчанию 1 — для одиночного вызова _fetch_comments_page().
+        self.pages_fetched = pages_fetched
+        # dict {"remaining": float, "reset": float, "used": float|None} —
+        # разобранные X-Ratelimit-* заголовки последнего запроса, либо
+        # None, если сервер их не прислал. См. parse_ratelimit_headers().
+        self.ratelimit = ratelimit
 
+
+async def _fetch_comments_page(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    subs_joined: str,
+    fetch_limit: int,
+    proxy_url: str,
+    timeout: int,
+    account_name: str,
+    http_executor: ThreadPoolExecutor,
+    after: str | None = None,
+    impersonate: str = "chrome",
+    connect_timeout: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
+) -> FetchResult:
+    """Один HTTP-запрос к .../comments.json (одна страница листинга).
+    Пагинацию по нескольким страницам делает fetch_comments() ниже.
+
+    `timeout` здесь используется как read-таймаут (время на получение
+    ответа после установленного соединения), `connect_timeout` — отдельный,
+    как правило меньший таймаут на TCP/TLS-хендшейк и DNS-резолвинг.
+    Оба передаются в curl_cffi явно, парой, а не одним общим числом —
+    см. "Блокирующие вызовы" в шапке файла."""
+    url = f"{base_url}/r/{subs_joined}/comments.json"
+    params = {"limit": fetch_limit}
+    if after:
+        params["after"] = after
+
+    # curl_cffi не умеет работать с aiohttp.ClientSession, поэтому cookies
+    # вытаскиваем из неё вручную и передаём явно.
+    cookies = {c.key: c.value for c in session.cookie_jar}
+
+    call = functools.partial(
+        cffi_requests.get,
+        url,
+        # TLS/JA3- и HTTP2-отпечаток задаётся на аккаунт (accounts.yaml,
+        # ключ impersonate) и остаётся неизменным для этого аккаунта на
+        # всём протяжении его жизни — фиксированная пара с user_agent
+        # ниже, а не случайное значение на каждый запрос (см. README).
+        impersonate=impersonate,
+        params=params,
+        proxies={"http": proxy_url, "https": proxy_url} if proxy_url else None,
+        cookies=cookies,
+        # Явная пара (connect_timeout, read_timeout) вместо одного общего
+        # timeout=: зависший DNS/TCP/TLS-хендшейк отваливается по
+        # connect_timeout, не дожидаясь полного read_timeout — curl_cffi
+        # прерывает сам себя раньше, чем это придётся делать снаружи через
+        # wait_for (см. "Блокирующие вызовы" в шапке файла).
+        timeout=(connect_timeout, timeout),
+        allow_redirects=True,
+    )
+
+    # Запас, с которым обёрнут run_in_executor ниже: полное время на
+    # connect + read, плюс HTTP_EXECUTOR_SLACK_SECONDS на случай, если
+    # сами сокет-таймауты curl_cffi почему-то не сработали вовремя.
+    total_wait = connect_timeout + timeout + HTTP_EXECUTOR_SLACK_SECONDS
+
+    try:
+        loop = asyncio.get_running_loop()
+        # Выделенный пул (см. шапку файла) вместо дефолтного shared-executor'а
+        # asyncio.to_thread: несколько гарантированных потоков про запас,
+        # зависшая прокси одного аккаунта не блокирует пул целиком.
+        # wait_for — подстраховка сверх connect/read-таймаутов curl_cffi на
+        # случай, если сам curl не среагировал на них вовремя (напр. DNS).
+        resp = await asyncio.wait_for(
+            loop.run_in_executor(http_executor, call),
+            timeout=total_wait,
+        )
+        # Разбираем X-Ratelimit-* сразу, независимо от статуса ответа —
+        # даже 429/5xx может нести актуальные remaining/reset, полезные
+        # для адаптации интервала опроса в account_worker.
+        ratelimit = parse_ratelimit_headers(resp)
+
+        if resp.status_code == 429:
+            retry_after = parse_retry_after(resp)
+            return FetchResult(status=429, retry_after=retry_after, error_kind="rate_or_server",
+                                ratelimit=ratelimit)
+        if resp.status_code in (401, 403):
+            return FetchResult(status=resp.status_code, error_kind="auth", ratelimit=ratelimit)
+        if resp.status_code >= 500:
+            return FetchResult(status=resp.status_code, error_kind="rate_or_server", ratelimit=ratelimit)
+        if resp.status_code != 200:
+            log.warning("[%s] Reddit вернул неожиданный статус %s", account_name, resp.status_code)
+            return FetchResult(status=resp.status_code, error_kind="rate_or_server", ratelimit=ratelimit)
+
+        data = resp.json()
+
+    except asyncio.TimeoutError:
+        # Поток мог не успеть за timeout + slack — цикл воркера всё равно
+        # разблокируется и уходит в обычный network-backoff; сам поток
+        # curl_cffi доработает и освободится в фоне самостоятельно.
+        log.warning(
+            "[%s] Запрос к Reddit не уложился в %.0fs (connect=%.0fs+read=%.0fs+запас) — проверь mihomo/порт",
+            account_name, total_wait, connect_timeout, timeout,
+        )
+        return FetchResult(error_kind="network")
+    except cffi_requests.RequestsError as e:
+        log.warning("[%s] Ошибка запроса к Reddit (проверь mihomo/порт): %s", account_name, e)
+        return FetchResult(error_kind="network")
+    except (json.JSONDecodeError, ValueError) as e:
+        # HTTP 200, но тело — не валидный JSON: капча/интерстишл от Cloudflare,
+        # HTML-страница ошибки, залипший 502 в теле формально успешного
+        # ответа и т.п. Reddit-специфичной ошибки тут нет (status_code уже
+        # прошёл проверку выше), поэтому это не "auth" и не "rate_or_server" —
+        # трактуем как сетевую аномалию и уходим в тот же backoff-путь, что
+        # и обычные network-ошибки, вместо падения воркера с необработанным
+        # исключением (ValueError — родитель json.JSONDecodeError, ловим оба
+        # на случай нестандартного JSON-парсера внутри curl_cffi).
+        log.warning(
+            "[%s] Reddit вернул 200, но тело не распарсилось как JSON "
+            "(похоже на капчу/интерстишл CDN): %s", account_name, e,
+        )
+        return FetchResult(error_kind="network")
+
+    listing_data = data.get("data", {})
+    children = listing_data.get("children", [])
+    comments = [c.get("data", {}) for c in children if c.get("kind") == "t1"]
+
+    # "after" из тела ответа — штатный курсор пагинации Reddit. Если его
+    # почему-то нет (некоторые конфигурации/старые версии эндпоинта), но
+    # комментарии есть — берём fullname последнего как fallback.
+    listing_after = listing_data.get("after")
+    if not listing_after and comments:
+        listing_after = comments[-1].get("name")
+
+    return FetchResult(comments=comments, status=200, after=listing_after, ratelimit=ratelimit)
 
 async def fetch_comments(
     session: aiohttp.ClientSession,
@@ -344,67 +552,63 @@ async def fetch_comments(
     timeout: int,
     account_name: str,
     http_executor: ThreadPoolExecutor,
+    max_age: float,
+    max_pages: int,
+    impersonate: str = "chrome",
+    connect_timeout: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
 ) -> FetchResult:
-    url = f"{base_url}/r/{subs_joined}/comments.json"
-    params = {"limit": fetch_limit}
+    """Тянет одну или несколько страниц .../comments.json подряд (см.
+    "Пагинация fetch-запроса" в шапке файла) и возвращает объединённый
+    результат. Ошибка на любой странице обрывает пагинацию и возвращает
+    именно эту ошибку — уже накопленные комментарии этого цикла отбрасываются
+    (это безопасно, см. пояснение в шапке файла про SeenCache)."""
+    all_comments: list[dict] = []
+    after: str | None = None
+    pages_fetched = 0
 
-    # curl_cffi не умеет работать с aiohttp.ClientSession, поэтому cookies
-    # вытаскиваем из неё вручную и передаём явно.
-    cookies = {c.key: c.value for c in session.cookie_jar}
-
-    call = functools.partial(
-        cffi_requests.get,
-        url,
-        impersonate="chrome",
-        params=params,
-        proxies={"http": proxy_url, "https": proxy_url} if proxy_url else None,
-        cookies=cookies,
-        timeout=timeout,
-        allow_redirects=True,
-    )
-
-    try:
-        loop = asyncio.get_running_loop()
-        # Выделенный пул (см. шапку файла) вместо дефолтного shared-executor'а
-        # asyncio.to_thread: гарантированный поток на аккаунт, зависшая
-        # прокси одного аккаунта не съедает пул у остальных.
-        # wait_for — подстраховка сверх HTTP-таймаута curl_cffi на случай,
-        # если сам curl не среагировал на timeout= вовремя (напр. DNS).
-        resp = await asyncio.wait_for(
-            loop.run_in_executor(http_executor, call),
-            timeout=timeout + HTTP_EXECUTOR_SLACK_SECONDS,
+    while True:
+        page = await _fetch_comments_page(
+            session, base_url, subs_joined, fetch_limit, proxy_url, timeout,
+            account_name, http_executor, after, impersonate, connect_timeout,
         )
 
-        if resp.status_code == 429:
-            retry_after = parse_retry_after(resp)
-            return FetchResult(status=429, retry_after=retry_after, error_kind="rate_or_server")
-        if resp.status_code in (401, 403):
-            return FetchResult(status=resp.status_code, error_kind="auth")
-        if resp.status_code >= 500:
-            return FetchResult(status=resp.status_code, error_kind="rate_or_server")
-        if resp.status_code != 200:
-            log.warning("[%s] Reddit вернул неожиданный статус %s", account_name, resp.status_code)
-            return FetchResult(status=resp.status_code, error_kind="rate_or_server")
+        if page.error_kind is not None:
+            return page
 
-        data = resp.json()
+        pages_fetched += 1
+        all_comments.extend(page.comments)
 
-    except asyncio.TimeoutError:
-        # Поток мог не успеть за timeout + slack — цикл воркера всё равно
-        # разблокируется и уходит в обычный network-backoff; сам поток
-        # curl_cffi доработает и освободится в фоне самостоятельно.
-        log.warning(
-            "[%s] Запрос к Reddit не уложился в %.0fs (timeout+запас) — проверь mihomo/порт",
-            account_name, timeout + HTTP_EXECUTOR_SLACK_SECONDS,
+        if not page.comments:
+            break
+
+        last_created = page.comments[-1].get("created_utc")
+        last_age = (time.time() - last_created) if last_created is not None else None
+
+        # Последний (самый старый) комментарий страницы уже старше лимита
+        # свежести — дальше в листинге только ещё более старые, следующая
+        # страница ничего полезного не даст.
+        if last_age is None or last_age > max_age:
+            break
+        if not page.after:
+            break
+        if pages_fetched >= max_pages:
+            log.info(
+                "[%s] достигнут pagination_max_pages=%d, последний коммент страницы "
+                "всё ещё свежий (age=%.1fs <= max_age=%ss) — останавливаю пагинацию цикла",
+                account_name, max_pages, last_age, max_age,
+            )
+            break
+
+        log.info(
+            "[%s] стр.%d: последний коммент ещё свежий (age=%.1fs <= max_age=%ss) — тяну следующую страницу",
+            account_name, pages_fetched, last_age, max_age,
         )
-        return FetchResult(error_kind="network")
-    except cffi_requests.RequestsError as e:
-        log.warning("[%s] Ошибка запроса к Reddit (проверь mihomo/порт): %s", account_name, e)
-        return FetchResult(error_kind="network")
+        after = page.after
 
-    children = data.get("data", {}).get("children", [])
-    comments = [c.get("data", {}) for c in children if c.get("kind") == "t1"]
-    return FetchResult(comments=comments, status=200)
-
+    # ratelimit берём с последней (самой свежей) полученной страницы —
+    # именно её remaining/reset актуальны на момент завершения цикла.
+    return FetchResult(comments=all_comments, status=200, pages_fetched=pages_fetched,
+                        ratelimit=page.ratelimit)
 
 def _item_ok(entry) -> bool:
     """Разбирает один элемент results[] из ответа /store_items.
@@ -517,6 +721,12 @@ async def account_worker(
 
     # User-Agent: приоритет — свой в accounts.yaml, иначе дефолтный из config.yaml.
     user_agent = account.get("user_agent") or config.get("user_agent", "Mozilla/5.0")
+    # TLS/JA3-отпечаток curl_cffi (impersonate) — тоже свой на аккаунт,
+    # и ФИКСИРОВАННЫЙ на всё время жизни аккаунта. Обязательно должен
+    # соответствовать семейству браузера из user_agent (см. README) —
+    # рассинхрон UA и impersonate палится сверкой TLS-отпечатка с
+    # заявленным в заголовках браузером.
+    impersonate = account.get("impersonate") or config.get("impersonate", "chrome")
     headers = {
         "User-Agent": user_agent,
         "Accept": "application/json, text/plain, */*",
@@ -530,7 +740,10 @@ async def account_worker(
     )
 
     await asyncio.sleep(phase_offset)
-    log.info("[%s] Старт (прокси %s, фаза +%.1fs, UA=%.40s...)", name, proxy_url, phase_offset, user_agent)
+    log.info(
+        "[%s] Старт (прокси %s, фаза +%.1fs, impersonate=%s, UA=%.40s...)",
+        name, proxy_url, phase_offset, impersonate, user_agent,
+    )
 
     async with aiohttp.ClientSession(cookies=cookies, headers=headers) as session:
         while True:
@@ -539,9 +752,20 @@ async def account_worker(
             subs_joined = "+".join(config.get("subreddits", []))
             fetch_limit = config.get("fetch_limit", 50)
             max_age = config.get("max_age_seconds", 15)
+            pagination_max_pages = config.get("pagination_max_pages", 3)
             poll_interval = config.get("poll_interval_seconds", 3)
             jitter_ratio = config.get("poll_jitter_ratio", 0.25)
+            respect_ratelimit_headers = config.get("respect_ratelimit_headers", True)
+            # Запас: используем не 100% оставшегося окна, а safety_margin
+            # от него — иначе счёт "впритык" ломается от первой же
+            # рассинхронизации часов/сети и мы всё равно ловим 429.
+            ratelimit_safety_margin = config.get("ratelimit_safety_margin", 0.85)
+            # timeout — read-таймаут (после установленного соединения);
+            # connect_timeout — отдельный, обычно меньший таймаут на
+            # DNS/TCP/TLS-хендшейк. Оба уходят в curl_cffi парой, а не
+            # одним общим числом (см. "Блокирующие вызовы" в шапке файла).
             timeout = config.get("request_timeout_seconds", 10)
+            connect_timeout = config.get("connect_timeout_seconds", DEFAULT_CONNECT_TIMEOUT_SECONDS)
             token_wait_timeout = config.get("token_wait_timeout_seconds", 0.5)
             store_endpoint = STORE_ENDPOINT_OVERRIDE or config.get("store_endpoint")
             batch_max_items = config.get("batch_max_items", 500)
@@ -555,7 +779,8 @@ async def account_worker(
                 continue
 
             result = await fetch_comments(
-                session, base_url, subs_joined, fetch_limit, proxy_url, timeout, name, http_executor
+                session, base_url, subs_joined, fetch_limit, proxy_url, timeout, name, http_executor,
+                max_age, pagination_max_pages, impersonate, connect_timeout,
             )
 
             # ---- обработка ошибок / backoff ----
@@ -627,25 +852,48 @@ async def account_worker(
 
             sent = 0
             if to_send:
-                ok_flags = await send_batch_to_store(
-                    store_session, store_endpoint, to_send, name, batch_max_items
-                )
-                for p, ok in zip(to_send, ok_flags):
-                    if ok:
-                        # Подтверждено сервером (или как минимум 2xx на
-                        # весь батч) -> окончательно помечаем seen.
-                        await seen.confirm(p["external_id"])
-                        sent += 1
-                        log.info(
-                            "[%s] OK  %-12s age=%.1fs  %s",
-                            name, p["external_id"], p["_age_seconds"],
-                            p["content"][:60].replace("\n", " "),
-                        )
-                    else:
-                        # Батч (или конкретный айтем) не подтверждён —
-                        # освобождаем claim, чтобы он не считался дублем
-                        # в следующем цикле опроса и мог уйти повторно.
-                        await seen.release(p["external_id"])
+                # try/finally: гарантируем, что каждый item_id, заявленный
+                # через try_claim() выше, будет либо confirm(), либо
+                # release() — независимо от того, чем закончится отправка.
+                # Без этого необработанное исключение в send_batch_to_store
+                # (не-ClientError/TimeoutError, например неожиданный баг
+                # парсинга) или CancelledError (таска воркера отменена
+                # снаружи, например при shutdown) прервали бы выполнение
+                # ДО for-цикла ниже (или посреди него) — часть to_send так
+                # и осталась бы висеть в seen._pending навсегда: try_claim()
+                # для этих id всегда возвращал бы False, и они бы медленно,
+                # но неограниченно копились там месяцами.
+                released_ids: set[str] = set()
+                try:
+                    ok_flags = await send_batch_to_store(
+                        store_session, store_endpoint, to_send, name, batch_max_items
+                    )
+                    for p, ok in zip(to_send, ok_flags):
+                        if ok:
+                            # Подтверждено сервером (или как минимум 2xx на
+                            # весь батч) -> окончательно помечаем seen.
+                            await seen.confirm(p["external_id"])
+                            released_ids.add(p["external_id"])
+                            sent += 1
+                            log.info(
+                                "[%s] OK  %-12s age=%.1fs  %s",
+                                name, p["external_id"], p["_age_seconds"],
+                                p["content"][:60].replace("\n", " "),
+                            )
+                        else:
+                            # Батч (или конкретный айтем) не подтверждён —
+                            # освобождаем claim, чтобы он не считался дублем
+                            # в следующем цикле опроса и мог уйти повторно.
+                            await seen.release(p["external_id"])
+                            released_ids.add(p["external_id"])
+                finally:
+                    # Всё, что не дошло до confirm()/release() выше (батч
+                    # упал с необработанным исключением ДО получения
+                    # ok_flags, или итерация по zip(...) была прервана
+                    # CancelledError на середине) — освобождаем здесь.
+                    for p in to_send:
+                        if p["external_id"] not in released_ids:
+                            await seen.release(p["external_id"])
 
             if sent or dropped_rate or to_send:
                 not_confirmed = len(to_send) - sent
@@ -657,9 +905,51 @@ async def account_worker(
                 )
 
             elapsed = time.monotonic() - cycle_start
-            base_sleep = max(0.0, poll_interval - elapsed)
+
+            # Считаем интервал с учетом количества выкачанных страниц
+            pages_count = getattr(result, "pages_fetched", 1)
+            adjusted_interval = poll_interval * max(1, pages_count)
+
+            # ---- адаптация по X-Ratelimit-* (если сервер их присылает) ----
+            # Идея: равномерно размазать оставшиеся remaining запросов по
+            # оставшемуся окну reset секунд, вместо того чтобы жить только
+            # по статичному poll_interval из config.yaml и узнавать о
+            # приближении лимита лишь по факту 429. Это НЕ подмена
+            # poll_interval — только увеличение эффективного интервала
+            # сверх сконфигурированного, если заголовки говорят, что
+            # текущий темп не продержится до конца окна; поднять частоту
+            # выше config.yaml эта логика никогда не может.
+            ratelimit = getattr(result, "ratelimit", None)
+            if respect_ratelimit_headers and ratelimit:
+                remaining = ratelimit["remaining"]
+                reset = ratelimit["reset"]
+                if remaining <= 1:
+                    # Лимит окна фактически исчерпан — ждём до reset
+                    # (плюс небольшой запас), а не долбим ещё раз впустую.
+                    rl_interval = reset + 1.0
+                    log.warning(
+                        "[%s] X-Ratelimit почти исчерпан (remaining=%.0f) — жду reset=%.1fs",
+                        name, remaining, reset,
+                    )
+                elif reset > 0:
+                    # safety_margin < 1.0 — намеренно не тратим впритык
+                    # весь remaining, оставляем запас на джиттер/рассинхрон.
+                    rl_interval = reset / (remaining * ratelimit_safety_margin)
+                else:
+                    rl_interval = 0.0
+
+                if rl_interval > adjusted_interval:
+                    log.info(
+                        "[%s] X-Ratelimit: remaining=%.0f reset=%.1fs -> интервал %.1fs "
+                        "(вместо %.1fs из конфига)",
+                        name, remaining, reset, rl_interval, adjusted_interval,
+                    )
+                    adjusted_interval = rl_interval
+
+            # 1.0s — гарантированный минимальный отдых при любых задержках
+            base_sleep = max(1.0, adjusted_interval - elapsed)
             jittered_sleep = base_sleep * random.uniform(1 - jitter_ratio, 1 + jitter_ratio)
-            await asyncio.sleep(max(0.0, jittered_sleep))
+            await asyncio.sleep(jittered_sleep)
 
 
 async def _acquire_with_retry(bucket: TokenBucket, deadline: float) -> bool:
@@ -671,6 +961,33 @@ async def _acquire_with_retry(bucket: TokenBucket, deadline: float) -> bool:
             return False
         await asyncio.sleep(0.02)
 
+async def supervised(
+    coro_fn,
+    *args,
+    name: str = "worker",
+    base_backoff: float = 2.0,
+    max_backoff: float = 60.0,
+    **kwargs,
+):
+    """Перезапускает coro_fn(*args, **kwargs), если она упала с
+    необработанным исключением, вместо того чтобы уронить весь
+    asyncio.gather(). Нормальный return (воркер сам решил завершиться)
+    не перезапускается — перезапуск только при Exception."""
+    attempt = 0
+    while True:
+        try:
+            await coro_fn(*args, **kwargs)
+            return  # воркер штатно завершился — выходим, не рестартуем
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            attempt += 1
+            delay = min(max_backoff, base_backoff * (2 ** (attempt - 1)))
+            log.exception(
+                "[%s] воркер упал (попытка %d), рестарт через %.1fs",
+                name, attempt, delay,
+            )
+            await asyncio.sleep(delay)
 
 # ---------------------------------------------------------------- #
 #  main
@@ -696,11 +1013,20 @@ async def main():
     bucket = TokenBucket(config.get("target_rate_per_second", 25))
     seen = SeenCache(config.get("seen_cache_size", 1000))
 
-    # Выделенный пул потоков под блокирующие curl_cffi-вызовы — ровно по
-    # одному гарантированному потоку на каждый воркер-аккаунт, отдельно
+    # Выделенный пул потоков под блокирующие curl_cffi-вызовы, отдельно
     # от дефолтного shared-executor'а asyncio.to_thread (см. шапку файла).
+    # Важно: НЕ ровно len(accounts) — asyncio.wait_for не может убить
+    # реальный поток при таймауте, только отменить asyncio-обёртку вокруг
+    # него; если у аккаунта завис сокет/DNS, его поток в executor'е может
+    # остаться занятым навсегда. При max_workers == len(accounts) это
+    # значит, что зависший поток одного аккаунта перманентно отнимает
+    # единственный запасной слот, и следующий run_in_executor того же (или
+    # любого другого) воркера встаёт в очередь без шанса на освобождение.
+    # max(32, len(accounts) * 2) даёт запас потоков, которого хватает
+    # пережить несколько таких зависаний одновременно, не останавливая
+    # остальных воркеров.
     http_executor = ThreadPoolExecutor(
-        max_workers=len(accounts),
+        max_workers=max(32, len(accounts) * 2),
         thread_name_prefix="reddit-fetch",
     )
 
@@ -711,8 +1037,10 @@ async def main():
                 phase_offset = i * (config.get("poll_interval_seconds", 3) / len(accounts))
                 tasks.append(
                     asyncio.create_task(
-                        account_worker(
-                            account, config, bucket, seen, phase_offset, store_session, http_executor
+                        supervised(
+                            account_worker,
+                            account, config, bucket, seen, phase_offset, store_session, http_executor,
+                            name=account["name"]
                         )
                     )
                 )
