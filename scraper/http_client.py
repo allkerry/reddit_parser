@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import json
+import random
 import time
 from concurrent.futures import ThreadPoolExecutor
 from curl_cffi import requests as cffi_requests
@@ -181,12 +182,22 @@ async def fetch_comments(
     max_pages: int,
     impersonate: str = "chrome",
     connect_timeout: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
+    pagination_delay_min: float = 0.0,
+    pagination_delay_max: float = 0.0,
 ) -> FetchResult:
     """Тянет одну или несколько страниц .../comments.json подряд (см.
     "Пагинация fetch-запроса" в шапке файла) и возвращает объединённый
     результат. Ошибка на любой странице обрывает пагинацию и возвращает
     именно эту ошибку — уже накопленные комментарии этого цикла отбрасываются
-    (это безопасно, см. пояснение в шапке файла про SeenCache)."""
+    (это безопасно, см. пояснение в шапке файла про SeenCache).
+
+    `pagination_delay_min`/`pagination_delay_max` (сек) — если задан
+    ненулевой диапазон, перед КАЖДОЙ страницей, следующей за первой,
+    делается случайная пауза (равномерно из этого диапазона). Это не
+    влияет на первую страницу цикла — она уходит сразу, как и раньше;
+    пауза только между уже последовавшими друг за другом запросами
+    страниц внутри одного цикла опроса, чтобы они не шли слитно, без
+    задержки вообще (это само по себе предсказуемый, "ботовый" паттерн)."""
     all_comments: list[dict] = []
     after: str | None = None
     pages_fetched = 0
@@ -228,6 +239,21 @@ async def fetch_comments(
             "[%s] стр.%d: последний коммент ещё свежий (age=%.1fs <= max_age=%ss) — тяну следующую страницу",
             account_name, pages_fetched, last_age, max_age,
         )
+
+        # Случайная пауза перед следующей страницей пагинации (см. описание
+        # параметров выше) — только если диапазон реально задан и не нулевой,
+        # чтобы не ломать вызовы, где параметры не передали (дефолт 0.0/0.0
+        # эквивалентен старому поведению без пауз).
+        if pagination_delay_max > 0:
+            lo = min(pagination_delay_min, pagination_delay_max)
+            hi = max(pagination_delay_min, pagination_delay_max)
+            delay = random.uniform(lo, hi)
+            log.debug(
+                "[%s] пауза %.2fs перед стр.%d пагинации",
+                account_name, delay, pages_fetched + 1,
+            )
+            await asyncio.sleep(delay)
+
         after = page.after
 
     # ratelimit берём с последней (самой свежей) полученной страницы —

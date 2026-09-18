@@ -66,6 +66,12 @@ async def account_worker(
             fetch_limit = config.get("fetch_limit", 50)
             max_age = config.get("max_age_seconds", 15)
             pagination_max_pages = config.get("pagination_max_pages", 3)
+            # Случайная пауза МЕЖДУ запросами страниц пагинации внутри
+            # одного цикла опроса (см. описание в config.yaml и в
+            # http_client.fetch_comments) — не влияет на самый первый
+            # запрос цикла, только на 2-ю и последующие страницы.
+            pagination_delay_min = config.get("pagination_delay_min_seconds", 0.4)
+            pagination_delay_max = config.get("pagination_delay_max_seconds", 1.5)
             poll_interval = config.get("poll_interval_seconds", 3)
             jitter_ratio = config.get("poll_jitter_ratio", 0.25)
             respect_ratelimit_headers = config.get("respect_ratelimit_headers", True)
@@ -73,6 +79,12 @@ async def account_worker(
             # от него — иначе счёт "впритык" ломается от первой же
             # рассинхронизации часов/сети и мы всё равно ловим 429.
             ratelimit_safety_margin = config.get("ratelimit_safety_margin", 0.85)
+            # Доп. джиттер прямо на расчётный интервал из X-Ratelimit-*
+            # (reset/remaining), ДО общего poll_jitter_ratio ниже — иначе
+            # сам расчётный интервал (напр. ровно 4.0с) остаётся "круглым"
+            # и предсказуемым до того, как к нему применится финальный
+            # джиттер сна. См. описание в config.yaml.
+            ratelimit_jitter_ratio = config.get("ratelimit_jitter_ratio", 0.15)
             # timeout — read-таймаут (после установленного соединения);
             # connect_timeout — отдельный, обычно меньший таймаут на
             # DNS/TCP/TLS-хендшейк. Оба уходят в curl_cffi парой, а не
@@ -94,6 +106,7 @@ async def account_worker(
             result = await fetch_comments(
                 session, base_url, subs_joined, fetch_limit, proxy_url, timeout, name, http_executor,
                 max_age, pagination_max_pages, impersonate, connect_timeout,
+                pagination_delay_min, pagination_delay_max,
             )
 
             # ---- обработка ошибок / backoff ----
@@ -250,6 +263,16 @@ async def account_worker(
                     rl_interval = reset / (remaining * ratelimit_safety_margin)
                 else:
                     rl_interval = 0.0
+
+                if rl_interval > 0 and ratelimit_jitter_ratio > 0:
+                    # Джиттер прямо на расчётный интервал (см. комментарий
+                    # у ratelimit_jitter_ratio выше) — иначе reset/remaining
+                    # часто даёт "круглые" числа вроде ровно 4.0с, что само
+                    # по себе легко угадываемый паттерн, ещё до того, как
+                    # к итоговому сну применится общий poll_jitter_ratio.
+                    rl_interval *= random.uniform(
+                        1 - ratelimit_jitter_ratio, 1 + ratelimit_jitter_ratio
+                    )
 
                 if rl_interval > adjusted_interval:
                     log.info(

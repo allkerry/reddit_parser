@@ -135,6 +135,17 @@ Docker-compose), `PROXY_HOST`, `STORE_ENDPOINT_OVERRIDE` (env
   ошибку целиком — уже накопленные страницы этого цикла отбрасываются
   (безопасно: они ещё не попали ни в `SeenCache`, ни в отправку, будут
   заново подхвачены на следующем цикле опроса).
+  Между запросом страницы N и страницы N+1 (если пагинация продолжается)
+  делается случайная пауза `random.uniform(pagination_delay_min,
+  pagination_delay_max)` — параметры приходят из `config.yaml`
+  (`pagination_delay_min_seconds`/`pagination_delay_max_seconds`) через
+  `account_worker`. Пауза не делается перед самой первой страницей цикла
+  (это по-прежнему момент, когда `poll_interval`/джиттер уже определили
+  время начала цикла) — только между уже идущими подряд запросами
+  N и N+1 внутри одной пагинации, чтобы они не шли слитно без задержки —
+  само по себе это был предсказуемый, "ботовый" паттерн. При
+  `pagination_delay_max <= 0` пауза не делается вовсе (обратная
+  совместимость со старым поведением).
 - `parse_retry_after`, `parse_ratelimit_headers` — разбор заголовков
   Reddit (`Retry-After`, `X-Ratelimit-Remaining/Reset/Used`).
 
@@ -211,12 +222,15 @@ Docker-compose), `PROXY_HOST`, `STORE_ENDPOINT_OVERRIDE` (env
 2. На каждой итерации цикла — читает актуальные значения из
    `ConfigStore` (hot-reload, поэтому это делается заново каждый раз, а
    не один раз при старте): список сабов, `fetch_limit`, `max_age`,
-   `pagination_max_pages`, `poll_interval`/`jitter_ratio`,
-   `respect_ratelimit_headers`, `ratelimit_safety_margin`, таймауты,
-   `token_wait_timeout`, `store_endpoint` (с приоритетом
-   `STORE_ENDPOINT_OVERRIDE` из env), `batch_max_items`, `reddit_base_url`;
-   обновляет `bucket.update_rate(...)`.
-3. `fetch_comments(...)` → при `error_kind`:
+   `pagination_max_pages`, `pagination_delay_min_seconds`/
+   `pagination_delay_max_seconds`, `poll_interval`/`jitter_ratio`,
+   `respect_ratelimit_headers`, `ratelimit_safety_margin`,
+   `ratelimit_jitter_ratio`, таймауты, `token_wait_timeout`,
+   `store_endpoint` (с приоритетом `STORE_ENDPOINT_OVERRIDE` из env),
+   `batch_max_items`, `reddit_base_url`; обновляет
+   `bucket.update_rate(...)`.
+3. `fetch_comments(...)` (получает в т.ч. `pagination_delay_min/max` —
+   см. `http_client.py` выше) → при `error_kind`:
    - `"rate_or_server"` → backoff, `continue` (без похода к остальным
      шагам цикла);
    - `"auth"` → backoff, при исчерпании лимита — `return` (воркер
@@ -246,10 +260,22 @@ Docker-compose), `PROXY_HOST`, `STORE_ENDPOINT_OVERRIDE` (env
      забрала несколько страниц, промежуток перед следующим циклом растёт
      пропорционально, чтобы не увеличивать эффективную частоту запросов);
    - если `respect_ratelimit_headers` и в ответе были `X-Ratelimit-*` —
-     интервал может быть **увеличен** (никогда не уменьшен ниже
-     конфига) на основе `remaining`/`reset`, с запасом
-     `ratelimit_safety_margin` (дефолт 0.85 — не тратим remaining впритык);
-   - минимум 1.0с, плюс джиттер `± poll_jitter_ratio`.
+     считается `rl_interval` из `remaining`/`reset`, с запасом
+     `ratelimit_safety_margin` (дефолт 0.85 — не тратим remaining
+     впритык); к самому `rl_interval` **до** сравнения с `adjusted_interval`
+     применяется джиттер `ratelimit_jitter_ratio` (дефолт ±15%) —
+     `rl_interval *= random.uniform(1 - ratio, 1 + ratio)` — чтобы
+     "круглый" расчёт по заголовкам (напр. ровно 4.0с при
+     `reset=60, remaining=15`) не был предсказуемым паттерном сам по
+     себе, ещё до общего джиттера ниже; если после этого `rl_interval >
+     adjusted_interval` — именно он используется как база сна (интервал
+     из конфига никогда не уменьшается этой логикой, только
+     увеличивается);
+   - минимум 1.0с, плюс общий джиттер `± poll_jitter_ratio`, применяемый
+     ко всему `adjusted_interval - elapsed` целиком (т.е. поверх и
+     `poll_interval`-базы, и возможной ratelimit-адаптации выше —
+     итоговый сон джиттерится дважды: один раз внутри самого
+     ratelimit-расчёта, и ещё раз на уровне всего интервала).
 
 `supervised(coro_fn, ...)` — обёртка вокруг `account_worker`: ловит
 любое `Exception` (кроме `CancelledError`, который пробрасывается дальше)
@@ -267,7 +293,9 @@ Docker-compose), `PROXY_HOST`, `STORE_ENDPOINT_OVERRIDE` (env
 ## 3. Поток одного цикла опроса (сводно)
 
 ```
-fetch_comments (пагинация, до pagination_max_pages)
+fetch_comments (пагинация, до pagination_max_pages,
+                со случайной паузой pagination_delay_min..max
+                между страницей N и N+1)
         │
         ▼
   ошибка? ──да──► backoff (по типу: rate_or_server / auth / network) ──► continue/return
@@ -297,7 +325,12 @@ send_batch_to_store(to_send) — чанками по batch_max_items
 по каждому: ok ──► seen.confirm   |   not ok ──► seen.release
         │
         ▼
-лог сводки цикла + сон (adaptive: pages_fetched, X-Ratelimit, jitter)
+лог сводки цикла + сон:
+  adjusted_interval = poll_interval * pages_fetched
+  если есть X-Ratelimit: rl_interval = reset/(remaining*safety_margin),
+                          джиттер ±ratelimit_jitter_ratio,
+                          adjusted_interval = max(adjusted_interval, rl_interval)
+  sleep = max(1.0, adjusted_interval - elapsed) * джиттер ±poll_jitter_ratio
 ```
 
 ---
@@ -405,3 +438,30 @@ send_batch_to_store(to_send) — чанками по batch_max_items
 `STORE_ENDPOINT`, `CONFIG_RELOAD_SECONDS`) позволяют докер-compose файлам
 переопределять пути и адреса без правки самого `config.yaml` — см.
 `docker-compose.yml`/`docker-compose.bridge.yml`.
+
+---
+
+## 9. Анти-детект: случайность на нескольких уровнях
+
+Помимо общих мер из README ("Защита от рейт-лимита / банов"), стоит
+явно понимать, на каких именно уровнях в цикле опроса сейчас есть
+случайность/джиттер — их несколько, и они не дублируют друг друга:
+
+1. **Фаза старта аккаунта** (`phase_offset` в `main.py`) — аккаунты не
+   стартуют синхронно, у каждого свой сдвиг по времени первого запроса.
+2. **Пауза между страницами пагинации внутри одного цикла**
+   (`pagination_delay_min_seconds`/`pagination_delay_max_seconds`,
+   `http_client.fetch_comments`) — запросы страница-за-страницей больше
+   не идут слитно без задержки.
+3. **Джиттер расчётного интервала из `X-Ratelimit-*`**
+   (`ratelimit_jitter_ratio`, `account_worker`) — сам расчёт
+   `reset/remaining` не остаётся "круглым" числом.
+4. **Общий джиттер интервала сна между циклами** (`poll_jitter_ratio`,
+   `account_worker`) — финальный сон варьируется независимо от того,
+   на основе чего был посчитан `adjusted_interval` (статичный
+   `poll_interval` или ratelimit-адаптация).
+
+Уровни 3 и 4 применяются последовательно (сначала внутри
+ratelimit-расчёта, потом ещё раз ко всему интервалу), поэтому итоговый
+эффект — не единственный плоский джиттер, а комбинация из двух
+независимых случайных множителей.
