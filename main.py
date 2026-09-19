@@ -141,7 +141,6 @@ async def main():
     try:
         store_connector = aiohttp.TCPConnector(ttl_dns_cache=300, keepalive_timeout=60)
         async with aiohttp.ClientSession(connector=store_connector) as store_session:
-<<<<<<< HEAD
             tasks = [
                 asyncio.create_task(config.reload_loop()),
                 asyncio.create_task(
@@ -152,24 +151,6 @@ async def main():
                         log,
                     )
                 ),
-=======
-            # reload_loop() тоже обёрнут в supervised(), как и account_worker
-            # ниже: без этого необработанное исключение внутри цикла
-            # ре-конфига (мимо внутреннего try/except вокруг load_once())
-            # пробрасывалось бы прямо в asyncio.gather(), который роняет
-            # ВСЕ задачи разом — все воркеры аккаунтов гасли бы из-за
-            # одной локальной ошибки в перечитывании config.yaml, а
-            # finally ниже ещё и рвал бы исполнение через
-            # http_executor.shutdown(cancel_futures=True) прямо под
-            # работающими запросами к Reddit. supervised() ловит
-            # исключение, логирует и перезапускает только эту задачу —
-            # остальные воркеры продолжают работать на последнем
-            # успешно загруженном конфиге.
-            tasks = [
-                asyncio.create_task(
-                    supervised(config.reload_loop, name="config_reload")
-                )
->>>>>>> origin/main
             ]
             for i, account in enumerate(accounts):
                 phase_offset = i * (config.get("poll_interval_seconds", 3) / len(accounts))
