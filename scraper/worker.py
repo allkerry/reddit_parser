@@ -38,7 +38,18 @@ async def account_worker(
     другом с самого начала (см. staggering ниже) и продолжают
     расходиться по мере того, как каждая группа подстраивает свой
     interval — это ещё один уровень анти-паттерна поверх джиттера,
-    описанного в ARCHITECTURE.md."""
+    описанного в ARCHITECTURE.md.
+
+    ВАЖНО про X-Ratelimit-*: эти заголовки отражают лимит на весь
+    аккаунт (одни cookies/IP на ВСЕ его группы), а не на конкретную
+    группу/саб. Поэтому реагировать на них должен не только тот цикл,
+    который их получил, а КАЖДЫЙ следующий запрос этого аккаунта —
+    см. `account_rl_gate` ниже. Раньше при близком исчерпании лимита
+    сдвигались все группы (`remaining <= 1`), но до этого порога каждая
+    группа откладывала только СВОЙ next_poll_at, а остальные группы
+    аккаунта продолжали ходить в Reddit по своему более короткому
+    расписанию и жгли тот же самый remaining/reset — именно это давало
+    неравномерный, "рваный" расход лимита (см. история изменений)."""
     name = account["name"]
     cookie_file = BASE_DIR / account["cookie_file"]
     proxy_port = account["proxy_port"]
@@ -74,6 +85,12 @@ async def account_worker(
         for g in groups
     ]
 
+    # "Ворота" на СЛЕДУЮЩИЙ запрос этого аккаунта (любой из его групп),
+    # выставляемые по X-Ratelimit-* — общие на всех участников цикла
+    # ниже, а не свойство какой-то одной GroupState. 0.0 = нет
+    # ограничения (ничего не получали ещё).
+    account_rl_gate = 0.0
+
     # Стартовое расписание: не сразу все группы разом (это было бы видно
     # как залп N запросов в первую же секунду), а размазано в пределах
     # собственного интервала каждой группы + сдвиг фазы аккаунта.
@@ -91,7 +108,12 @@ async def account_worker(
         while True:
             now = time.monotonic()
             gs = min(group_states, key=lambda g: g.next_poll_at)
-            wait = gs.next_poll_at - now
+            # Ждём максимум из "своего" расписания группы и общих для
+            # аккаунта ratelimit-ворот — иначе группа с коротким
+            # (hot) интервалом продолжит стрелять по своему графику,
+            # даже когда лимит аккаунта уже почти исчерпан.
+            wait_until = max(gs.next_poll_at, account_rl_gate)
+            wait = wait_until - now
             if wait > 0:
                 await asyncio.sleep(wait)
 
@@ -255,13 +277,26 @@ async def account_worker(
             pages_count = getattr(result, "pages_fetched", 1)
             adjusted_interval = gs.interval * max(1, pages_count)
 
-            # ---- адаптация по X-Ratelimit-* — общая для аккаунта, не
-            #      только для текущей группы: заголовки отражают лимит
-            #      целиком на cookies/IP этого аккаунта, а не на
-            #      конкретный саб. Поэтому при близком исчерпании лимита
-            #      сдвигаем ВСЕ группы аккаунта, а не только текущую —
-            #      иначе следующая по расписанию группа сразу же уйдёт в
-            #      те же 429. ----
+            base_sleep = max(1.0, adjusted_interval - elapsed)
+            jittered_sleep = base_sleep * random.uniform(1 - jitter_ratio, 1 + jitter_ratio)
+            candidate_next = cycle_start + jittered_sleep
+            gs.next_poll_at = max(gs.next_poll_at, candidate_next)
+
+            # ---- адаптация по X-Ratelimit-* — это ОБЩИЙ лимит на весь
+            #      аккаунт (одни cookies/IP на все его группы), а не на
+            #      конкретную группу, поэтому реагировать на него должен
+            #      не только цикл, который его получил, а КАЖДЫЙ
+            #      следующий запрос аккаунта. Раньше сюда попадала
+            #      только текущая gs (плюс "аварийный" сдвиг всех групп
+            #      при remaining<=1) — остальные группы аккаунта между
+            #      делом продолжали опрашиваться по своему более
+            #      короткому расписанию и жгли тот же самый бюджет,
+            #      который этот цикл только что увидел в заголовках, ещё
+            #      до того, как лимит становился критическим. Теперь
+            #      вместо точечного сдвига конкретных GroupState —
+            #      единые "ворота" `account_rl_gate`, которые проверяет
+            #      КАЖДАЯ итерация цикла перед тем, как взять любую
+            #      группу на опрос (см. `wait_until` в начале while).
             ratelimit = getattr(result, "ratelimit", None)
             if respect_ratelimit_headers and ratelimit:
                 remaining = ratelimit["remaining"]
@@ -269,14 +304,10 @@ async def account_worker(
                 if remaining <= 1:
                     rl_interval = reset + 1.0
                     log.warning(
-                        "[%s] X-Ratelimit почти исчерпан (remaining=%.0f) — жду reset=%.1fs "
-                        "(сдвигаю все группы аккаунта)",
+                        "[%s] X-Ratelimit почти исчерпан (remaining=%.0f) — следующий запрос "
+                        "аккаунта (любой группы) не раньше чем через reset=%.1fs",
                         name, remaining, reset,
                     )
-                    critical_at = time.monotonic() + rl_interval
-                    for other in group_states:
-                        if other.next_poll_at < critical_at:
-                            other.next_poll_at = critical_at
                 elif reset > 0:
                     rl_interval = reset / (remaining * ratelimit_safety_margin)
                 else:
@@ -287,20 +318,18 @@ async def account_worker(
                         1 - ratelimit_jitter_ratio, 1 + ratelimit_jitter_ratio
                     )
 
-                if rl_interval > adjusted_interval:
-                    log.info(
-                        "[%s] X-Ratelimit: remaining=%.0f reset=%.1fs -> интервал %.1fs "
-                        "(вместо %.1fs)",
-                        name, remaining, reset, rl_interval, adjusted_interval,
-                    )
-                    adjusted_interval = rl_interval
-
-            base_sleep = max(1.0, adjusted_interval - elapsed)
-            jittered_sleep = base_sleep * random.uniform(1 - jitter_ratio, 1 + jitter_ratio)
-            candidate_next = cycle_start + jittered_sleep
-            # Не откатываем назад то, что уже могло быть выставлено выше
-            # (критический ratelimit-сдвиг) более поздним временем.
-            gs.next_poll_at = max(gs.next_poll_at, candidate_next)
+                if rl_interval > 0:
+                    gate_at = time.monotonic() + rl_interval
+                    # Ворота могут только отодвигаться вперёд — более
+                    # ранний расчёт из предыдущего ответа не должен
+                    # "откатить" уже выставленное более позднее время.
+                    if gate_at > account_rl_gate:
+                        log.info(
+                            "[%s] X-Ratelimit: remaining=%.0f reset=%.1fs -> следующий запрос "
+                            "аккаунта не раньше чем через %.1fs (у этой группы(%s) было бы %.1fs)",
+                            name, remaining, reset, rl_interval, gs.tier, adjusted_interval,
+                        )
+                        account_rl_gate = gate_at
 
 
 async def _acquire_with_retry(bucket: TokenBucket, deadline: float) -> bool:
