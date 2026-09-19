@@ -21,6 +21,18 @@ Reddit fresh-comments scraper -> POST /store_items (batch)
   (мало комментариев -> реже, много -> чаще), а не остаётся фиксированной
   навсегда.
 
+Также в этой версии добавлен health-мониторинг http_executor (см.
+scraper/health.py): asyncio.wait_for() в http_client.py при таймауте не
+убивает физический поток curl_cffi (Python не умеет прерывать потоки
+снаружи) — если прокси/DNS зависают, поток остаётся занятым executor'ом
+навсегда, и за недели непрерывной работы фиксированный пул может
+постепенно исчерпаться, приводя к тихому параличу всех воркеров без
+единой явной ошибки в логах. ExecutorHealth считает реальную занятость
+пула (независимо от того, ждём мы ещё результат или уже отвалились по
+таймауту) и health_report_loop() раз в
+EXECUTOR_HEALTH_LOG_INTERVAL_SECONDS логирует снапшот — если active
+приближается к pool_size, в логе появляется предупреждение.
+
 Остальное — общий TokenBucket/SeenCache/ThreadPoolExecutor/backoff — как
 раньше, см. заголовок предыдущей версии этого файла в git-истории и
 ARCHITECTURE.md.
@@ -32,8 +44,16 @@ from concurrent.futures import ThreadPoolExecutor
 import aiohttp
 
 from scraper.config import ConfigStore, load_accounts
-from scraper.constants import BASE_DIR, CONFIG_PATH, CONFIG_RELOAD_SECONDS, PROXY_HOST, log
+from scraper.constants import (
+    BASE_DIR,
+    CONFIG_PATH,
+    CONFIG_RELOAD_SECONDS,
+    EXECUTOR_HEALTH_LOG_INTERVAL_SECONDS,
+    PROXY_HOST,
+    log,
+)
 from scraper.grouping import build_account_groups, build_account_groups_from_ranked
+from scraper.health import ExecutorHealth, health_report_loop
 from scraper.state import SeenCache, TokenBucket
 from scraper.worker import account_worker, supervised
 
@@ -107,15 +127,31 @@ async def main():
     bucket = TokenBucket(config.get("target_rate_per_second", 25))
     seen = SeenCache(config.get("seen_cache_size", 1000))
 
+    http_executor_max_workers = max(32, len(accounts) * 2)
     http_executor = ThreadPoolExecutor(
-        max_workers=max(32, len(accounts) * 2),
+        max_workers=http_executor_max_workers,
         thread_name_prefix="reddit-fetch",
     )
+
+    # Общий на процесс счётчик занятости http_executor (см.
+    # scraper/health.py) — диагностика зависших потоков curl_cffi,
+    # которые asyncio.wait_for() не может прервать принудительно.
+    executor_health = ExecutorHealth()
 
     try:
         store_connector = aiohttp.TCPConnector(ttl_dns_cache=300, keepalive_timeout=60)
         async with aiohttp.ClientSession(connector=store_connector) as store_session:
-            tasks = [asyncio.create_task(config.reload_loop())]
+            tasks = [
+                asyncio.create_task(config.reload_loop()),
+                asyncio.create_task(
+                    health_report_loop(
+                        executor_health,
+                        EXECUTOR_HEALTH_LOG_INTERVAL_SECONDS,
+                        http_executor_max_workers,
+                        log,
+                    )
+                ),
+            ]
             for i, account in enumerate(accounts):
                 phase_offset = i * (config.get("poll_interval_seconds", 3) / len(accounts))
                 tasks.append(
@@ -124,6 +160,7 @@ async def main():
                             account_worker,
                             account, config, bucket, seen, phase_offset, store_session, http_executor,
                             groups_by_account.get(account["name"], []),
+                            executor_health,
                             name=account["name"]
                         )
                     )

@@ -9,6 +9,7 @@ from curl_cffi import requests as cffi_requests
 import aiohttp
 
 from .constants import DEFAULT_CONNECT_TIMEOUT_SECONDS, HTTP_EXECUTOR_SLACK_SECONDS, log
+from .health import ExecutorHealth
 from .models import FetchResult
 
 
@@ -56,6 +57,7 @@ async def _fetch_comments_page(
     after: str | None = None,
     impersonate: str = "chrome",
     connect_timeout: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
+    executor_health: ExecutorHealth | None = None,
 ) -> FetchResult:
     """Один HTTP-запрос к .../comments.json (одна страница листинга).
     Пагинацию по нескольким страницам делает fetch_comments() ниже.
@@ -64,7 +66,15 @@ async def _fetch_comments_page(
     ответа после установленного соединения), `connect_timeout` — отдельный,
     как правило меньший таймаут на TCP/TLS-хендшейк и DNS-резолвинг.
     Оба передаются в curl_cffi явно, парой, а не одним общим числом —
-    см. "Блокирующие вызовы" в шапке файла."""
+    см. "Блокирующие вызовы" в шапке файла.
+
+    `executor_health`, если передан, отслеживает реальную занятость
+    http_executor (см. scraper/health.py) — счётчик инкрементируется
+    перед постановкой задачи в пул и декрементируется через
+    add_done_callback на самом Future, а не после await wait_for(...):
+    таймаут wait_for не останавливает физический поток curl_cffi (Python
+    не умеет прерывать потоки снаружи), поэтому "занято" должно отражать
+    реальное состояние потока, а не то, ждём мы его ещё или уже нет."""
     url = f"{base_url}/r/{subs_joined}/comments.json"
     params = {"limit": fetch_limit}
     if after:
@@ -104,12 +114,21 @@ async def _fetch_comments_page(
         # Выделенный пул (см. шапку файла) вместо дефолтного shared-executor'а
         # asyncio.to_thread: несколько гарантированных потоков про запас,
         # зависшая прокси одного аккаунта не блокирует пул целиком.
+        future = loop.run_in_executor(http_executor, call)
+
+        if executor_health is not None:
+            executor_health.on_submit()
+            # Срабатывает, когда поток РЕАЛЬНО закончил работу (успешно,
+            # с исключением или отменой) — не когда мы перестали его
+            # ждать снаружи. Именно это делает счётчик пригодным для
+            # диагностики зависших потоков: даже если ниже сработает
+            # asyncio.TimeoutError, эта callback НЕ вызовется, пока поток
+            # действительно не освободится (или не зависнет навсегда).
+            future.add_done_callback(executor_health.on_future_done)
+
         # wait_for — подстраховка сверх connect/read-таймаутов curl_cffi на
         # случай, если сам curl не среагировал на них вовремя (напр. DNS).
-        resp = await asyncio.wait_for(
-            loop.run_in_executor(http_executor, call),
-            timeout=total_wait,
-        )
+        resp = await asyncio.wait_for(future, timeout=total_wait)
         # Разбираем X-Ratelimit-* сразу, независимо от статуса ответа —
         # даже 429/5xx может нести актуальные remaining/reset, полезные
         # для адаптации интервала опроса в account_worker.
@@ -132,7 +151,11 @@ async def _fetch_comments_page(
     except asyncio.TimeoutError:
         # Поток мог не успеть за timeout + slack — цикл воркера всё равно
         # разблокируется и уходит в обычный network-backoff; сам поток
-        # curl_cffi доработает и освободится в фоне самостоятельно.
+        # curl_cffi доработает и освободится в фоне самостоятельно (или
+        # зависнет навсегда — именно это и покажет executor_health, см.
+        # scraper/health.py: on_future_done для него просто не наступит).
+        if executor_health is not None:
+            executor_health.on_wait_timeout()
         log.warning(
             "[%s] Запрос к Reddit не уложился в %.0fs (connect=%.0fs+read=%.0fs+запас) — проверь mihomo/порт",
             account_name, total_wait, connect_timeout, timeout,
@@ -184,6 +207,7 @@ async def fetch_comments(
     connect_timeout: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
     pagination_delay_min: float = 0.0,
     pagination_delay_max: float = 0.0,
+    executor_health: ExecutorHealth | None = None,
 ) -> FetchResult:
     """Тянет одну или несколько страниц .../comments.json подряд (см.
     "Пагинация fetch-запроса" в шапке файла) и возвращает объединённый
@@ -197,7 +221,10 @@ async def fetch_comments(
     влияет на первую страницу цикла — она уходит сразу, как и раньше;
     пауза только между уже последовавшими друг за другом запросами
     страниц внутри одного цикла опроса, чтобы они не шли слитно, без
-    задержки вообще (это само по себе предсказуемый, "ботовый" паттерн)."""
+    задержки вообще (это само по себе предсказуемый, "ботовый" паттерн).
+
+    `executor_health` пробрасывается в каждую отдельную страницу — см.
+    _fetch_comments_page()."""
     all_comments: list[dict] = []
     after: str | None = None
     pages_fetched = 0
@@ -206,6 +233,7 @@ async def fetch_comments(
         page = await _fetch_comments_page(
             session, base_url, subs_joined, fetch_limit, proxy_url, timeout,
             account_name, http_executor, after, impersonate, connect_timeout,
+            executor_health,
         )
 
         if page.error_kind is not None:

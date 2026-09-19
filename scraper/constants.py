@@ -26,6 +26,11 @@ HTTP_EXECUTOR_SLACK_SECONDS = 5
 # тела ответа на уже установленном соединении.
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 5
 
+# Как часто (в секундах) логировать снапшот занятости http_executor
+# (см. scraper/health.py) — фоновая задача в main.py. Не влияет на сам
+# счётчик, только на частоту логирования его текущего значения.
+EXECUTOR_HEALTH_LOG_INTERVAL_SECONDS = float(os.environ.get("EXECUTOR_HEALTH_LOG_INTERVAL_SECONDS", "300"))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
