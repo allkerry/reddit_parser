@@ -7,7 +7,6 @@ import aiohttp
 
 from .config import ConfigStore, load_cookies
 from .constants import BASE_DIR, DEFAULT_CONNECT_TIMEOUT_SECONDS, PROXY_HOST, STORE_ENDPOINT_OVERRIDE, log
-from .health import ExecutorHealth
 from .http_client import fetch_comments
 from .pipeline import build_payload, send_batch_to_store
 from .state import BackoffState, GroupState, SeenCache, TokenBucket
@@ -27,24 +26,19 @@ async def account_worker(
     store_session: aiohttp.ClientSession,
     http_executor: ThreadPoolExecutor,
     groups: list[dict],
-    executor_health: ExecutorHealth | None = None,
 ):
     """Один аккаунт теперь опрашивает НЕСКОЛЬКО групп сабреддитов (см.
     scraper/grouping.py), а не один статичный список. У каждой группы —
     своё расписание (GroupState.next_poll_at), которое адаптируется по
     фактическому выходу этой группы. Цикл воркера каждую итерацию берёт
-    группу с самым близким next_poll_at, ждёт до этого момента (если
-    нужно) и опрашивает именно её.
+    группу с самым близким next_poll_at (с учётом account_not_before, см.
+    ниже), ждёт до этого момента (если нужно) и опрашивает именно её.
 
     Реалистичные интервалы опроса разных сабов не совпадают друг с
     другом с самого начала (см. staggering ниже) и продолжают
     расходиться по мере того, как каждая группа подстраивает свой
     interval — это ещё один уровень анти-паттерна поверх джиттера,
-    описанного в ARCHITECTURE.md.
-
-    `executor_health` (см. scraper/health.py) — общий на процесс счётчик
-    занятости http_executor, пробрасывается дальше в fetch_comments() /
-    _fetch_comments_page() для диагностики зависших потоков curl_cffi."""
+    описанного в ARCHITECTURE.md."""
     name = account["name"]
     cookie_file = BASE_DIR / account["cookie_file"]
     proxy_port = account["proxy_port"]
@@ -87,6 +81,14 @@ async def account_worker(
     for gs in group_states:
         gs.next_poll_at = start_at + random.uniform(0, gs.interval)
 
+    # Общий "пол" на весь аккаунт: раньше этого момента НИ ОДНА группа
+    # этого аккаунта не должна опрашиваться. X-Ratelimit-* отражает лимит
+    # на cookies/IP аккаунта целиком, а не на конкретную группу/саб —
+    # поэтому это состояние на уровне аккаунта, а не GroupState.
+    # Растёт монотонно (см. блок X-Ratelimit ниже): более поздний ответ с
+    # меньшим rl_interval не откатывает его назад.
+    account_not_before = 0.0
+
     log.info(
         "[%s] Старт (прокси %s, фаза +%.1fs, impersonate=%s, %d групп: %s)",
         name, proxy_url, phase_offset, impersonate, len(group_states),
@@ -96,8 +98,8 @@ async def account_worker(
     async with aiohttp.ClientSession(cookies=cookies, headers=headers) as session:
         while True:
             now = time.monotonic()
-            gs = min(group_states, key=lambda g: g.next_poll_at)
-            wait = gs.next_poll_at - now
+            gs = min(group_states, key=lambda g: max(g.next_poll_at, account_not_before))
+            wait = max(gs.next_poll_at, account_not_before) - now
             if wait > 0:
                 await asyncio.sleep(wait)
 
@@ -149,7 +151,6 @@ async def account_worker(
                 session, base_url, subs_joined, fetch_limit_jittered, proxy_url, timeout, name,
                 http_executor, effective_max_age, pagination_max_pages, impersonate, connect_timeout,
                 pagination_delay_min, pagination_delay_max,
-                executor_health=executor_health,
             )
 
             # ---- обработка ошибок / backoff (общий на аккаунт, не на
@@ -262,28 +263,22 @@ async def account_worker(
             pages_count = getattr(result, "pages_fetched", 1)
             adjusted_interval = gs.interval * max(1, pages_count)
 
-            # ---- адаптация по X-Ratelimit-* — общая для аккаунта, не
+            # ---- адаптация по X-Ratelimit-* — общая для АККАУНТА, не
             #      только для текущей группы: заголовки отражают лимит
             #      целиком на cookies/IP этого аккаунта, а не на
             #      конкретный саб. Поэтому при близком исчерпании лимита
-            #      сдвигаем ВСЕ группы аккаунта, а не только текущую —
-            #      иначе следующая по расписанию группа сразу же уйдёт в
-            #      те же 429. ----
+            #      двигаем общий account_not_before, который учитывается
+            #      при выборе ЛЮБОЙ группы этого аккаунта (см. min(...)
+            #      в начале цикла) — иначе следующая по расписанию группа
+            #      (с более коротким собственным интервалом) сразу же
+            #      уйдёт в те же 429, даже если для другой группы этого
+            #      же аккаунта интервал был честно посчитан и залогирован. ----
             ratelimit = getattr(result, "ratelimit", None)
             if respect_ratelimit_headers and ratelimit:
                 remaining = ratelimit["remaining"]
                 reset = ratelimit["reset"]
                 if remaining <= 1:
                     rl_interval = reset + 1.0
-                    log.warning(
-                        "[%s] X-Ratelimit почти исчерпан (remaining=%.0f) — жду reset=%.1fs "
-                        "(сдвигаю все группы аккаунта)",
-                        name, remaining, reset,
-                    )
-                    critical_at = time.monotonic() + rl_interval
-                    for other in group_states:
-                        if other.next_poll_at < critical_at:
-                            other.next_poll_at = critical_at
                 elif reset > 0:
                     rl_interval = reset / (remaining * ratelimit_safety_margin)
                 else:
@@ -294,19 +289,25 @@ async def account_worker(
                         1 - ratelimit_jitter_ratio, 1 + ratelimit_jitter_ratio
                     )
 
-                if rl_interval > adjusted_interval:
-                    log.info(
-                        "[%s] X-Ratelimit: remaining=%.0f reset=%.1fs -> интервал %.1fs "
-                        "(вместо %.1fs)",
-                        name, remaining, reset, rl_interval, adjusted_interval,
-                    )
-                    adjusted_interval = rl_interval
+                if rl_interval > 0:
+                    candidate_not_before = time.monotonic() + rl_interval
+                    # Монотонный рост: более ранний (уже действующий) пол
+                    # не откатывается назад более коротким rl_interval,
+                    # который мог прийти со следующим ответом.
+                    if candidate_not_before > account_not_before:
+                        account_not_before = candidate_not_before
+                        log.info(
+                            "[%s] X-Ratelimit: remaining=%.0f reset=%.1fs -> аккаунт "
+                            "не опрашивается ближайшие %.1fs (ни одной из его групп)",
+                            name, remaining, reset, rl_interval,
+                        )
 
             base_sleep = max(1.0, adjusted_interval - elapsed)
             jittered_sleep = base_sleep * random.uniform(1 - jitter_ratio, 1 + jitter_ratio)
             candidate_next = cycle_start + jittered_sleep
             # Не откатываем назад то, что уже могло быть выставлено выше
-            # (критический ratelimit-сдвиг) более поздним временем.
+            # (например, если group_states делят один и тот же gs с уже
+            # более поздним next_poll_at из другого источника).
             gs.next_poll_at = max(gs.next_poll_at, candidate_next)
 
 
