@@ -5,6 +5,57 @@ from collections import deque
 
 
 # ---------------------------------------------------------------- #
+#  Состояние одной multi-sub группы внутри аккаунта (адаптивный
+#  интервал опроса + собственное расписание next_poll_at)
+# ---------------------------------------------------------------- #
+
+class GroupState:
+    """Один аккаунт опрашивает НЕСКОЛЬКО групп сабреддитов (см.
+    scraper/grouping.py), каждая — со своим расписанием. Изначальный
+    интервал берётся из tier_base_interval_seconds (hot/medium/cold), но
+    дальше подстраивается сам по фактическому выходу (числу "свежих"
+    комментариев за цикл), а не остаётся fixed навсегда:
+
+    - мало айтемов подряд (группа почти мёртвая) -> интервал растёт
+      (экономим запросы, не долбим бесполезно);
+    - много айтемов (близко к target_max_items — риск, что за окно
+      между опросами накопится больше, чем реально забирается за один
+      fetch, и часть будет отрезана max_age/пагинацией) -> интервал
+      уменьшается;
+    - в целевом коридоре -> не трогаем.
+
+    Интервал в любом случае ограничен [min_interval_seconds,
+    max_interval_seconds] из конфига."""
+
+    __slots__ = ("subs", "tier", "interval", "ewma_items", "next_poll_at")
+
+    def __init__(self, subs: list[str], tier: str, base_interval: float):
+        self.subs = subs
+        self.tier = tier
+        self.interval = base_interval
+        self.ewma_items: float | None = None
+        self.next_poll_at = 0.0  # time.monotonic(), выставляется извне при старте
+
+    def record_yield(self, items: int, cfg: dict):
+        alpha = cfg.get("ewma_alpha", 0.3)
+        self.ewma_items = items if self.ewma_items is None else (
+            alpha * items + (1 - alpha) * self.ewma_items
+        )
+        factor = max(1.01, cfg.get("adjust_factor", 1.4))
+        min_i = cfg.get("min_interval_seconds", 2)
+        max_i = cfg.get("max_interval_seconds", 900)
+        target_min = cfg.get("target_min_items", 8)
+        target_max = cfg.get("target_max_items", 60)
+
+        if self.ewma_items < target_min:
+            self.interval = min(max_i, self.interval * factor)
+        elif self.ewma_items > target_max:
+            self.interval = max(min_i, self.interval / factor)
+        # иначе — выход в целевом коридоре, интервал не трогаем
+        self.interval = max(min_i, min(max_i, self.interval))
+
+
+# ---------------------------------------------------------------- #
 #  Общий rate limiter (token bucket) на отправку в store_items
 # ---------------------------------------------------------------- #
 
