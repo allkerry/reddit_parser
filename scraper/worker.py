@@ -7,6 +7,7 @@ import aiohttp
 
 from .config import ConfigStore, load_cookies
 from .constants import BASE_DIR, DEFAULT_CONNECT_TIMEOUT_SECONDS, PROXY_HOST, STORE_ENDPOINT_OVERRIDE, log
+from .health import ExecutorHealth
 from .http_client import fetch_comments
 from .pipeline import build_payload, send_batch_to_store
 from .state import BackoffState, GroupState, SeenCache, TokenBucket
@@ -26,6 +27,7 @@ async def account_worker(
     store_session: aiohttp.ClientSession,
     http_executor: ThreadPoolExecutor,
     groups: list[dict],
+    executor_health: ExecutorHealth | None = None,
 ):
     """Один аккаунт теперь опрашивает НЕСКОЛЬКО групп сабреддитов (см.
     scraper/grouping.py), а не один статичный список. У каждой группы —
@@ -38,7 +40,16 @@ async def account_worker(
     другом с самого начала (см. staggering ниже) и продолжают
     расходиться по мере того, как каждая группа подстраивает свой
     interval — это ещё один уровень анти-паттерна поверх джиттера,
-    описанного в ARCHITECTURE.md."""
+    описанного в ARCHITECTURE.md.
+
+    `executor_health`, если передан из main.py, пробрасывается в каждый
+    fetch_comments()/  _fetch_comments_page() — см. scraper/health.py и
+    "Блокирующие вызовы" в ARCHITECTURE.md. Раньше main.py уже передавал
+    этот аргумент сюда позиционным девятым параметром, а этой функции он
+    в сигнатуре не хватало — так что каждый вызов account_worker() падал
+    с TypeError ещё до первого запроса к Reddit, а supervised() тихо это
+    проглатывал и уходил в бесконечный рестарт-луп, не давая дойти даже
+    до fetch, не говоря уже про батчевую отправку."""
     name = account["name"]
     cookie_file = BASE_DIR / account["cookie_file"]
     proxy_port = account["proxy_port"]
@@ -151,6 +162,7 @@ async def account_worker(
                 session, base_url, subs_joined, fetch_limit_jittered, proxy_url, timeout, name,
                 http_executor, effective_max_age, pagination_max_pages, impersonate, connect_timeout,
                 pagination_delay_min, pagination_delay_max,
+                executor_health,
             )
 
             # ---- обработка ошибок / backoff (общий на аккаунт, не на
