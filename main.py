@@ -33,12 +33,21 @@ scraper/health.py): asyncio.wait_for() в http_client.py при таймауте
 EXECUTOR_HEALTH_LOG_INTERVAL_SECONDS логирует снапшот — если active
 приближается к pool_size, в логе появляется предупреждение.
 
+Graceful shutdown: и SIGINT (Ctrl+C), и SIGTERM (docker stop /
+docker compose down / docker compose restart) явно перехватываются
+через loop.add_signal_handler и штатно отменяют все фоновые задачи —
+раньше SIGTERM не обрабатывался вовсе (Python транслирует в
+KeyboardInterrupt только SIGINT), и контейнер, скорее всего, просто
+убивался по таймауту docker stop (SIGTERM -> 10с -> SIGKILL) без единой
+строки в логе о причине остановки.
+
 Остальное — общий TokenBucket/SeenCache/ThreadPoolExecutor/backoff — как
 раньше, см. заголовок предыдущей версии этого файла в git-истории и
 ARCHITECTURE.md.
 """
 
 import asyncio
+import signal
 from concurrent.futures import ThreadPoolExecutor
 
 import aiohttp
@@ -97,6 +106,35 @@ def _build_groups(config: ConfigStore, account_names: list[str]) -> dict[str, li
     return build_account_groups_from_ranked(ranked, account_names, **kwargs)
 
 
+def _install_signal_handlers(loop: asyncio.AbstractEventLoop, stop_event: asyncio.Event):
+    """Вешает обработчики SIGTERM и SIGINT на текущий event loop.
+
+    По умолчанию asyncio транслирует в KeyboardInterrupt ТОЛЬКО SIGINT —
+    SIGTERM (именно его шлют `docker stop` / `docker compose down` /
+    `docker compose restart`) молча убивает процесс мимо всех
+    try/finally и async-with, если не перехватить его явно. Здесь
+    обработчик не делает саму остановку — он лишь выставляет
+    stop_event, а вся логика штатного завершения (отмена задач,
+    закрытие сессий) живёт в main() ниже, в обычном асинхронном коде."""
+
+    def _handle_stop_signal(sig_name: str):
+        if not stop_event.is_set():
+            log.info("Получен сигнал %s — начинаю штатную остановку", sig_name)
+            stop_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _handle_stop_signal, sig.name)
+        except NotImplementedError:
+            # add_signal_handler недоступен на этой платформе (например,
+            # стандартный event loop на Windows) — оставляем дефолтное
+            # поведение asyncio для неё (SIGINT -> KeyboardInterrupt).
+            log.debug(
+                "add_signal_handler недоступен для %s на этой платформе — "
+                "используется поведение asyncio по умолчанию", sig.name,
+            )
+
+
 async def main():
     config = ConfigStore(CONFIG_PATH, CONFIG_RELOAD_SECONDS)
     config.load_once()
@@ -138,18 +176,23 @@ async def main():
     # которые asyncio.wait_for() не может прервать принудительно.
     executor_health = ExecutorHealth()
 
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+    _install_signal_handlers(loop, stop_event)
+
     try:
         store_connector = aiohttp.TCPConnector(ttl_dns_cache=300, keepalive_timeout=60)
         async with aiohttp.ClientSession(connector=store_connector) as store_session:
             tasks = [
-                asyncio.create_task(config.reload_loop()),
+                asyncio.create_task(config.reload_loop(), name="config_reload_loop"),
                 asyncio.create_task(
                     health_report_loop(
                         executor_health,
                         EXECUTOR_HEALTH_LOG_INTERVAL_SECONDS,
                         http_executor_max_workers,
                         log,
-                    )
+                    ),
+                    name="health_report_loop",
                 ),
             ]
             for i, account in enumerate(accounts):
@@ -162,16 +205,55 @@ async def main():
                             groups_by_account.get(account["name"], []),
                             executor_health,
                             name=account["name"]
-                        )
+                        ),
+                        name=f"account_worker[{account['name']}]",
                     )
                 )
-            await asyncio.gather(*tasks)
+
+            # Гонка между "любая из фоновых задач завершилась сама" и
+            # "пришёл сигнал остановки" — что бы ни случилось раньше,
+            # ведёт к одному и тому же штатному пути отмены ниже.
+            stop_waiter = asyncio.create_task(stop_event.wait(), name="stop_signal_waiter")
+            done, _pending = await asyncio.wait(
+                [*tasks, stop_waiter], return_when=asyncio.FIRST_COMPLETED
+            )
+
+            if stop_waiter in done:
+                log.info("Останавливаю %d фоновых задач...", len(tasks))
+            else:
+                stop_waiter.cancel()
+                # Одна из задач (воркер/reload_loop/health_report_loop)
+                # завершилась сама по себе, не по сигналу — это не должно
+                # происходить в штатном режиме (supervised() перезапускает
+                # воркеры при исключениях сам, а вложенные reload/health
+                # циклы бесконечны), так что пробрасываем исключение, если
+                # оно там было, вместо того чтобы тихо продолжать с одной
+                # мёртвой задачей.
+                for t in done:
+                    if t is not stop_waiter:
+                        exc = t.exception()
+                        if exc is not None:
+                            log.error("Задача %s завершилась с ошибкой, останавливаю процесс", t.get_name())
+
+            # Штатная отмена всего остального, что ещё работает — и в
+            # случае сигнала, и в случае неожиданного завершения одной
+            # из задач выше. gather(..., return_exceptions=True), чтобы
+            # CancelledError отменённых задач не всплыл наружу и не
+            # помешал остальным корректно доотмениться.
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
     finally:
         http_executor.shutdown(wait=False, cancel_futures=True)
+
+    log.info("Остановлено штатно")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log.info("Остановлено пользователем")
+        # Подстраховка: на платформах без add_signal_handler (Windows)
+        # SIGINT по-прежнему приходит сюда стандартным путём asyncio.
+        log.info("Остановлено пользователем (KeyboardInterrupt)")
