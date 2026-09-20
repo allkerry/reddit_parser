@@ -86,7 +86,14 @@ async def account_worker(
     # на cookies/IP аккаунта целиком, а не на конкретную группу/саб —
     # поэтому это состояние на уровне аккаунта, а не GroupState.
     # Растёт монотонно (см. блок X-Ratelimit ниже): более поздний ответ с
-    # меньшим rl_interval не откатывает его назад.
+    # меньшим rl_interval не откатывает его назад. Сам rl_interval при
+    # этом всегда обрезается сверху (ratelimit_max_interval_seconds,
+    # см. ниже) — без этого один аномальный/повреждённый заголовок
+    # X-Ratelimit-Reset (баг Reddit/CDN, кривой прокси) мог бы застопорить
+    # весь аккаунт на часы или дни: parse_ratelimit_headers() уже
+    # отбраковывает совсем безумные значения на входе, но верхний потолок
+    # здесь — это второй, независимый рубеж защиты именно от залипания
+    # account_not_before.
     account_not_before = 0.0
 
     log.info(
@@ -114,6 +121,12 @@ async def account_worker(
             respect_ratelimit_headers = config.get("respect_ratelimit_headers", True)
             ratelimit_safety_margin = config.get("ratelimit_safety_margin", 0.85)
             ratelimit_jitter_ratio = config.get("ratelimit_jitter_ratio", 0.15)
+            # Верхний потолок на rl_interval / account_not_before — см.
+            # комментарий у объявления account_not_before выше. Дефолт
+            # 900s (15 мин) — заведомо больше любого честного окна
+            # X-Ratelimit-Reset у Reddit (обычно минуты), но всё ещё
+            # намного меньше "застрял на часы/дни".
+            ratelimit_max_interval = config.get("ratelimit_max_interval_seconds", 900)
             timeout = config.get("request_timeout_seconds", 10)
             connect_timeout = config.get("connect_timeout_seconds", DEFAULT_CONNECT_TIMEOUT_SECONDS)
             token_wait_timeout = config.get("token_wait_timeout_seconds", 0.5)
@@ -205,55 +218,32 @@ async def account_worker(
 
             payloads.sort(key=lambda p: p["_age_seconds"])
 
-            # ---- сбор to_send + отправка: единый try/finally на ВЕСЬ
-            #      путь от claim до confirm/release. Раньше finally стоял
-            #      только вокруг send_batch_to_store, а цикл try_claim/
-            #      _acquire_with_retry выше него ничем не был защищён —
-            #      необработанное исключение (или, что реальнее,
-            #      CancelledError при отмене задачи воркера, который
-            #      supervised() специально пробрасывает дальше, а не
-            #      глотает) посреди этого цикла оставляло id в
-            #      SeenCache._pending навсегда: _pending — обычный set()
-            #      без TTL и верхнего предела, а SeenCache общий на
-            #      процесс и переживает рестарт account_worker внутри
-            #      supervised(). Застрявший в _pending id больше никогда
-            #      не пройдёт try_claim() — комментарий молча и навсегда
-            #      перестаёт когда-либо отправляться. Теперь claimed_ids
-            #      фиксируется сразу после успешного try_claim (до
-            #      следующего await, который мог бы быть отменён), а
-            #      resolved_ids — только на путях, где уже вызван
-            #      confirm()/release(); в finally релизится разница
-            #      (claimed, но не resolved) при любом выходе из блока,
-            #      включая исключение/отмену на любом шаге. ----
             to_send: list[dict] = []
-            claimed_ids: set[str] = set()
-            resolved_ids: set[str] = set()
             dropped_dup = dropped_rate = 0
+            for p in payloads:
+                if not await seen.try_claim(p["external_id"]):
+                    dropped_dup += 1
+                    continue
+
+                got_token = await _acquire_with_retry(bucket, token_wait_timeout)
+                if not got_token:
+                    await seen.release(p["external_id"])
+                    dropped_rate += 1
+                    continue
+
+                to_send.append(p)
+
             sent = 0
-
-            try:
-                for p in payloads:
-                    if not await seen.try_claim(p["external_id"]):
-                        dropped_dup += 1
-                        continue
-                    claimed_ids.add(p["external_id"])
-
-                    got_token = await _acquire_with_retry(bucket, token_wait_timeout)
-                    if not got_token:
-                        await seen.release(p["external_id"])
-                        resolved_ids.add(p["external_id"])
-                        dropped_rate += 1
-                        continue
-
-                    to_send.append(p)
-
-                if to_send:
+            if to_send:
+                released_ids: set[str] = set()
+                try:
                     ok_flags = await send_batch_to_store(
                         store_session, store_endpoint, to_send, name, batch_max_items
                     )
                     for p, ok in zip(to_send, ok_flags):
                         if ok:
                             await seen.confirm(p["external_id"])
+                            released_ids.add(p["external_id"])
                             sent += 1
                             log.info(
                                 "[%s] OK  %-12s age=%.1fs  %s",
@@ -262,16 +252,11 @@ async def account_worker(
                             )
                         else:
                             await seen.release(p["external_id"])
-                        resolved_ids.add(p["external_id"])
-            finally:
-                # Всё, что было заявлено (claimed_ids), но не дошло ни до
-                # confirm(), ни до release() (resolved_ids) на момент
-                # выхода из блока — освобождаем явно. При штатном
-                # прохождении цикла claimed_ids == resolved_ids и это
-                # тело не делает ничего; срабатывает только на
-                # исключении/отмене посреди сбора или отправки.
-                for item_id in claimed_ids - resolved_ids:
-                    await seen.release(item_id)
+                            released_ids.add(p["external_id"])
+                finally:
+                    for p in to_send:
+                        if p["external_id"] not in released_ids:
+                            await seen.release(p["external_id"])
 
             if sent or dropped_rate or to_send:
                 not_confirmed = len(to_send) - sent
@@ -300,7 +285,15 @@ async def account_worker(
             #      в начале цикла) — иначе следующая по расписанию группа
             #      (с более коротким собственным интервалом) сразу же
             #      уйдёт в те же 429, даже если для другой группы этого
-            #      же аккаунта интервал был честно посчитан и залогирован. ----
+            #      же аккаунта интервал был честно посчитан и залогирован.
+            #      rl_interval в любом случае обрезается сверху
+            #      ratelimit_max_interval_seconds — см. комментарий у
+            #      account_not_before выше: это защита от того, что один
+            #      аномальный ответ (пусть даже прошедший санити-чек в
+            #      parse_ratelimit_headers) застопорит аккаунт на
+            #      неопределённо долгий срок, т.к. account_not_before
+            #      растёт только монотонно вверх и сам по себе ничем не
+            #      ограничен. ----
             ratelimit = getattr(result, "ratelimit", None)
             if respect_ratelimit_headers and ratelimit:
                 remaining = ratelimit["remaining"]
@@ -316,6 +309,15 @@ async def account_worker(
                     rl_interval *= random.uniform(
                         1 - ratelimit_jitter_ratio, 1 + ratelimit_jitter_ratio
                     )
+
+                if rl_interval > ratelimit_max_interval:
+                    log.warning(
+                        "[%s] X-Ratelimit дал аномально большой интервал %.1fs "
+                        "(remaining=%.0f reset=%.1fs) — обрезаю до "
+                        "ratelimit_max_interval_seconds=%.0fs",
+                        name, rl_interval, remaining, reset, ratelimit_max_interval,
+                    )
+                    rl_interval = ratelimit_max_interval
 
                 if rl_interval > 0:
                     candidate_not_before = time.monotonic() + rl_interval

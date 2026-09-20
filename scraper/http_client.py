@@ -29,16 +29,34 @@ def parse_ratelimit_headers(resp) -> dict | None:
     X-Ratelimit-Used) из ответа Reddit. Обычно приходят все вместе; если
     сервер их не прислал (эндпоинт/CDN не отдаёт телеметрию) — возвращаем
     None, и адаптация по заголовкам просто не включается для этого
-    ответа (используется statичный poll_interval из config.yaml)."""
+    ответа (используется statичный poll_interval из config.yaml).
+
+    Дополнительно отбраковывает явно бракованные значения (баг на
+    стороне Reddit/CDN, кривой прокси, подменённый заголовок и т.п.) —
+    без этой проверки один такой ответ мог бы задать account_not_before
+    (см. worker.py) на часы/дни вперёд, застопорив весь аккаунт, т.к.
+    account_not_before растёт монотонно и сам по себе ничем не
+    ограничен. X-Ratelimit-Reset у Reddit — это окно в пределах
+    нескольких минут, поэтому значение вне [0, 3600] однозначно мусор,
+    а не реальная телеметрия."""
     try:
         remaining = resp.headers.get("X-Ratelimit-Remaining") or resp.headers.get("x-ratelimit-remaining")
         reset = resp.headers.get("X-Ratelimit-Reset") or resp.headers.get("x-ratelimit-reset")
         used = resp.headers.get("X-Ratelimit-Used") or resp.headers.get("x-ratelimit-used")
         if remaining is None or reset is None:
             return None
+        remaining_f = float(remaining)
+        reset_f = float(reset)
+        if remaining_f < 0 or not (0 <= reset_f <= 3600):
+            log.warning(
+                "Reddit прислал аномальные X-Ratelimit-заголовки "
+                "(remaining=%s reset=%s) — игнорирую, как будто их не было",
+                remaining, reset,
+            )
+            return None
         return {
-            "remaining": float(remaining),
-            "reset": float(reset),
+            "remaining": remaining_f,
+            "reset": reset_f,
             "used": float(used) if used is not None else None,
         }
     except (TypeError, ValueError):
