@@ -2,6 +2,16 @@
 # где network_mode: host не работает нативно как на Linux.
 #
 # Запуск:  docker compose -f docker-compose.bridge.yml up -d --build
+#
+# ЛОГИ: см. комментарий в docker-compose.yml — тот же лимит на
+# json-file (10MB x 3 файла на контейнер), чтобы логи не копились
+# бесконечно при restart: unless-stopped.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
 
 services:
   mihomo:
@@ -13,6 +23,7 @@ services:
     command: ["-d", "/root/.config/mihomo"]
     networks:
       - scraper_net
+    logging: *default-logging
 
   scraper:
     build:
@@ -38,6 +49,7 @@ services:
       - "host.docker.internal:host-gateway"
     networks:
       - scraper_net
+    logging: *default-logging
 
 networks:
   scraper_net:

@@ -1,4 +1,5 @@
 import logging
+import logging.handlers
 import os
 from pathlib import Path
 
@@ -64,8 +65,47 @@ EXECUTOR_SWAP_COOLDOWN_SECONDS = float(os.environ.get("EXECUTOR_SWAP_COOLDOWN_SE
 # тихо копить ОС-потоки неделями.
 EXECUTOR_FATAL_LEAK_MULTIPLIER = float(os.environ.get("EXECUTOR_FATAL_LEAK_MULTIPLIER", "10"))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+# ---------------------------------------------------------------- #
+#  Логирование
+#
+#  По умолчанию (LOG_FILE не задан) — как раньше, только в stdout/stderr
+#  через StreamHandler. Это ок под Docker: там за ограничение размера
+#  на диске отвечает logging-driver контейнера (см. `logging:` в
+#  docker-compose.yml/docker-compose.bridge.yml — json-file с max-size/
+#  max-file, иначе Docker копит json-log бесконечно при restart:
+#  unless-stopped).
+#
+#  Но при локальном запуске (`python3 main.py` без Docker, см. README
+#  "Вариант 2") или если вывод вручную перенаправляют в файл (`>
+#  scraper.log`), такого ограничения нет вообще — файл будет расти,
+#  пока не кончится место на диске. Поэтому если задан LOG_FILE — вместо
+#  простого stdout-хендлера используется RotatingFileHandler с явным
+#  потолком размера (LOG_MAX_BYTES, дефолт 10MB) и числом бэкапов
+#  (LOG_BACKUP_COUNT, дефолт 3) — старые куски лога ротируются и
+#  удаляются автоматически, а не копятся неограниченно.
+# ---------------------------------------------------------------- #
+LOG_FILE = os.environ.get("LOG_FILE")
+LOG_MAX_BYTES = int(os.environ.get("LOG_MAX_BYTES", str(10 * 1024 * 1024)))  # 10MB
+LOG_BACKUP_COUNT = int(os.environ.get("LOG_BACKUP_COUNT", "3"))
+
+_log_formatter = logging.Formatter(
+    fmt="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
 )
+
+if LOG_FILE:
+    _log_handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8",
+    )
+else:
+    _log_handler = logging.StreamHandler()
+
+_log_handler.setFormatter(_log_formatter)
+
+logging.basicConfig(level=logging.INFO, handlers=[_log_handler])
 log = logging.getLogger("scraper")
+
+if LOG_FILE:
+    log.info(
+        "Логирование в файл с ротацией: %s (max %d байт x %d бэкапов)",
+        LOG_FILE, LOG_MAX_BYTES, LOG_BACKUP_COUNT,
+    )

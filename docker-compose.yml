@@ -7,7 +7,20 @@
 #  РАБОТАЕТ "из коробки" ТОЛЬКО НА LINUX. На Mac/Windows (Docker Desktop)
 #  host-сеть не поддерживается так же нативно — смотри блок
 #  "bridge-вариант для Mac/Windows" в README.md.
+#
+#  ЛОГИ: без явного logging-драйвера Docker по умолчанию использует
+#  json-file БЕЗ ограничения размера — при restart: unless-stopped и
+#  работе неделями/месяцами файл лога контейнера растёт бесконечно и
+#  может забить диск. Ниже у обоих сервисов задан лимит: max-size 10MB
+#  на файл, max-file 3 файла (т.е. не больше ~30MB на контейнер,
+#  старые куски логов ротируются и удаляются автоматически).
 # ============================================================
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
 
 services:
   mihomo:
@@ -18,6 +31,7 @@ services:
     volumes:
       - ./mihomo_config.yaml:/root/.config/mihomo/config.yaml:ro
     command: ["-d", "/root/.config/mihomo"]
+    logging: *default-logging
 
   scraper:
     build:
@@ -38,3 +52,4 @@ services:
       - PROXY_HOST=127.0.0.1
       # Раскомментируй и поправь, если пайплайн слушает не на localhost хоста:
       # - STORE_ENDPOINT=http://127.0.0.1:9000/store_item
+    logging: *default-logging
