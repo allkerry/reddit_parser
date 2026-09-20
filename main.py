@@ -27,11 +27,28 @@ scraper/health.py): asyncio.wait_for() в http_client.py при таймауте
 снаружи) — если прокси/DNS зависают, поток остаётся занятым executor'ом
 навсегда, и за недели непрерывной работы фиксированный пул может
 постепенно исчерпаться, приводя к тихому параличу всех воркеров без
-единой явной ошибки в логах. ExecutorHealth считает реальную занятость
-пула (независимо от того, ждём мы ещё результат или уже отвалились по
-таймауту) и health_report_loop() раз в
-EXECUTOR_HEALTH_LOG_INTERVAL_SECONDS логирует снапшот — если active
-приближается к pool_size, в логе появляется предупреждение.
+единой явной ошибки в логах.
+
+Начиная с этой версии, health-мониторинг не только детектирует
+деградацию, но и лечит её: http_executor теперь не голый
+ThreadPoolExecutor, а ExecutorHandle (scraper/health.py) — обёртка,
+которую health_report_loop() может пересоздать "на лету", если занятость
+пула приближается к его размеру. Сам пул почистить нельзя (Python не
+умеет прерывать потоки снаружи), поэтому единственный рабочий вариант —
+списать старый пул целиком (уже не стартовавшие задачи отменяются, а
+реально зависшие потоки просто перестают быть чьей-либо заботой) и
+продолжить работу с новым, чистым. Два предохранителя защищают от того,
+чтобы сам своп не стал новой формой той же болезни: cooldown между
+свопами (иначе постоянно дохнущая VPN-нода заставила бы процесс
+штамповать новые пулы без остановки) и аварийный потолок по суммарно
+утёкшим потокам (если своп явно не успевает за темпом утечки — процесс
+сам завершается через SystemExit, отдавая перезапуск docker'у
+(`restart: unless-stopped`), вместо тихого накопления ОС-потоков
+неделями). ExecutorHandle передаётся в account_worker и резолвится в
+http_client.py на каждый отдельный HTTP-запрос (а не один раз при
+старте воркера) — благодаря этому даже долгоживущий воркер, который не
+падал и не перезапускался месяцами, подхватывает новый пул на
+следующем же цикле опроса, без своего собственного рестарта.
 
 Graceful shutdown: и SIGINT (Ctrl+C), и SIGTERM (docker stop /
 docker compose down / docker compose restart) явно перехватываются
@@ -41,9 +58,8 @@ KeyboardInterrupt только SIGINT), и контейнер, скорее вс
 убивался по таймауту docker stop (SIGTERM -> 10с -> SIGKILL) без единой
 строки в логе о причине остановки.
 
-Остальное — общий TokenBucket/SeenCache/ThreadPoolExecutor/backoff — как
-раньше, см. заголовок предыдущей версии этого файла в git-истории и
-ARCHITECTURE.md.
+Остальное — общий TokenBucket/SeenCache/backoff — как раньше, см.
+заголовок предыдущей версии этого файла в git-истории и ARCHITECTURE.md.
 """
 
 import asyncio
@@ -57,12 +73,15 @@ from scraper.constants import (
     BASE_DIR,
     CONFIG_PATH,
     CONFIG_RELOAD_SECONDS,
+    EXECUTOR_FATAL_LEAK_MULTIPLIER,
     EXECUTOR_HEALTH_LOG_INTERVAL_SECONDS,
+    EXECUTOR_SWAP_COOLDOWN_SECONDS,
+    EXECUTOR_SWAP_THRESHOLD,
     PROXY_HOST,
     log,
 )
 from scraper.grouping import build_account_groups, build_account_groups_from_ranked
-from scraper.health import ExecutorHealth, health_report_loop
+from scraper.health import ExecutorHandle, ExecutorHealth, health_report_loop
 from scraper.state import SeenCache, TokenBucket
 from scraper.worker import account_worker, supervised
 
@@ -165,15 +184,23 @@ async def main():
     bucket = TokenBucket(config.get("target_rate_per_second", 25))
     seen = SeenCache(config.get("seen_cache_size", 1000))
 
+    # ExecutorHandle вместо голого ThreadPoolExecutor — см. docstring
+    # модуля выше и scraper/health.py: позволяет health_report_loop
+    # пересоздать пул целиком, если он деградировал (зависшие потоки на
+    # мёртвых прокси/DNS, которые нельзя прервать снаружи).
     http_executor_max_workers = max(32, len(accounts) * 2)
-    http_executor = ThreadPoolExecutor(
+    http_executor_handle = ExecutorHandle(
+        factory=lambda: ThreadPoolExecutor(
+            max_workers=http_executor_max_workers,
+            thread_name_prefix="reddit-fetch",
+        ),
         max_workers=http_executor_max_workers,
-        thread_name_prefix="reddit-fetch",
     )
 
     # Общий на процесс счётчик занятости http_executor (см.
     # scraper/health.py) — диагностика зависших потоков curl_cffi,
-    # которые asyncio.wait_for() не может прервать принудительно.
+    # которые asyncio.wait_for() не может прервать принудительно, и
+    # источник данных для решения о свопе пула.
     executor_health = ExecutorHealth()
 
     loop = asyncio.get_running_loop()
@@ -188,9 +215,12 @@ async def main():
                 asyncio.create_task(
                     health_report_loop(
                         executor_health,
+                        http_executor_handle,
                         EXECUTOR_HEALTH_LOG_INTERVAL_SECONDS,
-                        http_executor_max_workers,
                         log,
+                        swap_threshold=EXECUTOR_SWAP_THRESHOLD,
+                        swap_cooldown_seconds=EXECUTOR_SWAP_COOLDOWN_SECONDS,
+                        fatal_leak_multiplier=EXECUTOR_FATAL_LEAK_MULTIPLIER,
                     ),
                     name="health_report_loop",
                 ),
@@ -201,7 +231,8 @@ async def main():
                     asyncio.create_task(
                         supervised(
                             account_worker,
-                            account, config, bucket, seen, phase_offset, store_session, http_executor,
+                            account, config, bucket, seen, phase_offset, store_session,
+                            http_executor_handle,
                             groups_by_account.get(account["name"], []),
                             executor_health,
                             name=account["name"]
@@ -213,6 +244,10 @@ async def main():
             # Гонка между "любая из фоновых задач завершилась сама" и
             # "пришёл сигнал остановки" — что бы ни случилось раньше,
             # ведёт к одному и тому же штатному пути отмены ниже.
+            # Сюда же попадает и штатный SystemExit из health_report_loop
+            # (аварийный потолок утечки потоков, см. scraper/health.py) —
+            # он всплывает как исключение задачи, а не как сигнал, и
+            # обрабатывается веткой "одна из задач завершилась сама" ниже.
             stop_waiter = asyncio.create_task(stop_event.wait(), name="stop_signal_waiter")
             done, _pending = await asyncio.wait(
                 [*tasks, stop_waiter], return_when=asyncio.FIRST_COMPLETED
@@ -226,9 +261,11 @@ async def main():
                 # завершилась сама по себе, не по сигналу — это не должно
                 # происходить в штатном режиме (supervised() перезапускает
                 # воркеры при исключениях сам, а вложенные reload/health
-                # циклы бесконечны), так что пробрасываем исключение, если
-                # оно там было, вместо того чтобы тихо продолжать с одной
-                # мёртвой задачей.
+                # циклы бесконечны, за исключением health_report_loop,
+                # который может сам себя остановить через SystemExit при
+                # неостановимой утечке потоков — см. scraper/health.py),
+                # так что пробрасываем исключение, если оно там было,
+                # вместо того чтобы тихо продолжать с одной мёртвой задачей.
                 for t in done:
                     if t is not stop_waiter:
                         exc = t.exception()
@@ -245,7 +282,10 @@ async def main():
                     t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
     finally:
-        http_executor.shutdown(wait=False, cancel_futures=True)
+        # Гасим ТЕКУЩИЙ пул handle'а — если за время работы процесса
+        # было несколько свопов, все более ранние пулы уже погашены
+        # внутри ExecutorHandle.swap() в момент своего свопа.
+        http_executor_handle.shutdown(wait=False, cancel_futures=True)
 
     log.info("Остановлено штатно")
 

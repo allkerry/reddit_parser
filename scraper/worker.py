@@ -1,12 +1,12 @@
 import asyncio
 import random
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import aiohttp
 
 from .config import ConfigStore, load_cookies
 from .constants import BASE_DIR, DEFAULT_CONNECT_TIMEOUT_SECONDS, PROXY_HOST, STORE_ENDPOINT_OVERRIDE, log
+from .health import ExecutorHandle, ExecutorHealth
 from .http_client import fetch_comments
 from .pipeline import build_payload, send_batch_to_store
 from .state import BackoffState, GroupState, SeenCache, TokenBucket
@@ -24,8 +24,9 @@ async def account_worker(
     seen: SeenCache,
     phase_offset: float,
     store_session: aiohttp.ClientSession,
-    http_executor: ThreadPoolExecutor,
+    http_executor: ExecutorHandle,
     groups: list[dict],
+    executor_health: ExecutorHealth | None = None,
 ):
     """Один аккаунт теперь опрашивает НЕСКОЛЬКО групп сабреддитов (см.
     scraper/grouping.py), а не один статичный список. У каждой группы —
@@ -38,7 +39,18 @@ async def account_worker(
     другом с самого начала (см. staggering ниже) и продолжают
     расходиться по мере того, как каждая группа подстраивает свой
     interval — это ещё один уровень анти-паттерна поверх джиттера,
-    описанного в ARCHITECTURE.md."""
+    описанного в ARCHITECTURE.md.
+
+    `http_executor` — ExecutorHandle (scraper/health.py), а не голый
+    ThreadPoolExecutor: пул под блокирующие вызовы curl_cffi может быть
+    пересоздан "на лету" из health_report_loop в main.py, если старый
+    деградировал (зависшие потоки на мёртвых прокси/DNS, которые Python
+    не может прервать снаружи). Здесь этот параметр только прокидывается
+    дальше в fetch_comments() как есть — резолвится он уже внутри
+    http_client.py, на каждый отдельный HTTP-запрос, а не один раз тут,
+    при старте воркера, — благодаря этому даже долгоживущий воркер,
+    который не падал и не перезапускался месяцами, подхватывает новый
+    пул сразу на следующем цикле опроса."""
     name = account["name"]
     cookie_file = BASE_DIR / account["cookie_file"]
     proxy_port = account["proxy_port"]
@@ -163,7 +175,7 @@ async def account_worker(
             result = await fetch_comments(
                 session, base_url, subs_joined, fetch_limit_jittered, proxy_url, timeout, name,
                 http_executor, effective_max_age, pagination_max_pages, impersonate, connect_timeout,
-                pagination_delay_min, pagination_delay_max,
+                pagination_delay_min, pagination_delay_max, executor_health,
             )
 
             # ---- обработка ошибок / backoff (общий на аккаунт, не на

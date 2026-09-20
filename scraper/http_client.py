@@ -3,13 +3,12 @@ import functools
 import json
 import random
 import time
-from concurrent.futures import ThreadPoolExecutor
 from curl_cffi import requests as cffi_requests
 
 import aiohttp
 
 from .constants import DEFAULT_CONNECT_TIMEOUT_SECONDS, HTTP_EXECUTOR_SLACK_SECONDS, log
-from .health import ExecutorHealth
+from .health import ExecutorHandle, ExecutorHealth
 from .models import FetchResult
 
 
@@ -71,7 +70,7 @@ async def _fetch_comments_page(
     proxy_url: str,
     timeout: int,
     account_name: str,
-    http_executor: ThreadPoolExecutor,
+    http_executor: ExecutorHandle,
     after: str | None = None,
     impersonate: str = "chrome",
     connect_timeout: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
@@ -86,8 +85,17 @@ async def _fetch_comments_page(
     Оба передаются в curl_cffi явно, парой, а не одним общим числом —
     см. "Блокирующие вызовы" в шапке файла.
 
+    `http_executor` — ExecutorHandle (см. scraper/health.py), а НЕ голый
+    ThreadPoolExecutor: пул может быть пересоздан "на лету" из
+    health_report_loop, если старый деградировал (зависшие потоки на
+    мёртвых прокси/DNS, которые Python не может прервать снаружи).
+    Резолвим `http_executor.current` именно здесь, в момент запроса, а
+    не принимаем сам executor заранее — иначе долгоживущий account_worker
+    (который может не перезапускаться неделями) держал бы ссылку на уже
+    списанный пул до своего следующего собственного рестарта.
+
     `executor_health`, если передан, отслеживает реальную занятость
-    http_executor (см. scraper/health.py) — счётчик инкрементируется
+    ТЕКУЩЕГО пула (см. scraper/health.py) — счётчик инкрементируется
     перед постановкой задачи в пул и декрементируется через
     add_done_callback на самом Future, а не после await wait_for(...):
     таймаут wait_for не останавливает физический поток curl_cffi (Python
@@ -132,7 +140,10 @@ async def _fetch_comments_page(
         # Выделенный пул (см. шапку файла) вместо дефолтного shared-executor'а
         # asyncio.to_thread: несколько гарантированных потоков про запас,
         # зависшая прокси одного аккаунта не блокирует пул целиком.
-        future = loop.run_in_executor(http_executor, call)
+        # .current резолвится именно сейчас (см. docstring выше) — если
+        # health_report_loop успел пересоздать пул между циклами этого
+        # воркера, следующий же запрос уйдёт уже в новый, чистый пул.
+        future = loop.run_in_executor(http_executor.current, call)
 
         if executor_health is not None:
             executor_health.on_submit()
@@ -171,7 +182,9 @@ async def _fetch_comments_page(
         # разблокируется и уходит в обычный network-backoff; сам поток
         # curl_cffi доработает и освободится в фоне самостоятельно (или
         # зависнет навсегда — именно это и покажет executor_health, см.
-        # scraper/health.py: on_future_done для него просто не наступит).
+        # scraper/health.py: on_future_done для него просто не наступит,
+        # active будет расти, и рано или поздно health_report_loop
+        # пересоздаст пул целиком).
         if executor_health is not None:
             executor_health.on_wait_timeout()
         log.warning(
@@ -218,7 +231,7 @@ async def fetch_comments(
     proxy_url: str,
     timeout: int,
     account_name: str,
-    http_executor: ThreadPoolExecutor,
+    http_executor: ExecutorHandle,
     max_age: float,
     max_pages: int,
     impersonate: str = "chrome",
@@ -232,6 +245,11 @@ async def fetch_comments(
     результат. Ошибка на любой странице обрывает пагинацию и возвращает
     именно эту ошибку — уже накопленные комментарии этого цикла отбрасываются
     (это безопасно, см. пояснение в шапке файла про SeenCache).
+
+    `http_executor` — ExecutorHandle, а не голый ThreadPoolExecutor (см.
+    docstring _fetch_comments_page выше) — пробрасывается в каждую
+    отдельную страницу как есть, .current резолвится уже там, на каждый
+    отдельный HTTP-запрос.
 
     `pagination_delay_min`/`pagination_delay_max` (сек) — если задан
     ненулевой диапазон, перед КАЖДОЙ страницей, следующей за первой,
