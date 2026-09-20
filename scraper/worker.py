@@ -7,7 +7,6 @@ import aiohttp
 
 from .config import ConfigStore, load_cookies
 from .constants import BASE_DIR, DEFAULT_CONNECT_TIMEOUT_SECONDS, PROXY_HOST, STORE_ENDPOINT_OVERRIDE, log
-from .health import ExecutorHealth
 from .http_client import fetch_comments
 from .pipeline import build_payload, send_batch_to_store
 from .state import BackoffState, GroupState, SeenCache, TokenBucket
@@ -27,7 +26,6 @@ async def account_worker(
     store_session: aiohttp.ClientSession,
     http_executor: ThreadPoolExecutor,
     groups: list[dict],
-    executor_health: ExecutorHealth | None = None,
 ):
     """Один аккаунт теперь опрашивает НЕСКОЛЬКО групп сабреддитов (см.
     scraper/grouping.py), а не один статичный список. У каждой группы —
@@ -40,16 +38,7 @@ async def account_worker(
     другом с самого начала (см. staggering ниже) и продолжают
     расходиться по мере того, как каждая группа подстраивает свой
     interval — это ещё один уровень анти-паттерна поверх джиттера,
-    описанного в ARCHITECTURE.md.
-
-    `executor_health`, если передан из main.py, пробрасывается в каждый
-    fetch_comments()/  _fetch_comments_page() — см. scraper/health.py и
-    "Блокирующие вызовы" в ARCHITECTURE.md. Раньше main.py уже передавал
-    этот аргумент сюда позиционным девятым параметром, а этой функции он
-    в сигнатуре не хватало — так что каждый вызов account_worker() падал
-    с TypeError ещё до первого запроса к Reddit, а supervised() тихо это
-    проглатывал и уходил в бесконечный рестарт-луп, не давая дойти даже
-    до fetch, не говоря уже про батчевую отправку."""
+    описанного в ARCHITECTURE.md."""
     name = account["name"]
     cookie_file = BASE_DIR / account["cookie_file"]
     proxy_port = account["proxy_port"]
@@ -162,7 +151,6 @@ async def account_worker(
                 session, base_url, subs_joined, fetch_limit_jittered, proxy_url, timeout, name,
                 http_executor, effective_max_age, pagination_max_pages, impersonate, connect_timeout,
                 pagination_delay_min, pagination_delay_max,
-                executor_health,
             )
 
             # ---- обработка ошибок / backoff (общий на аккаунт, не на
@@ -217,32 +205,55 @@ async def account_worker(
 
             payloads.sort(key=lambda p: p["_age_seconds"])
 
+            # ---- сбор to_send + отправка: единый try/finally на ВЕСЬ
+            #      путь от claim до confirm/release. Раньше finally стоял
+            #      только вокруг send_batch_to_store, а цикл try_claim/
+            #      _acquire_with_retry выше него ничем не был защищён —
+            #      необработанное исключение (или, что реальнее,
+            #      CancelledError при отмене задачи воркера, который
+            #      supervised() специально пробрасывает дальше, а не
+            #      глотает) посреди этого цикла оставляло id в
+            #      SeenCache._pending навсегда: _pending — обычный set()
+            #      без TTL и верхнего предела, а SeenCache общий на
+            #      процесс и переживает рестарт account_worker внутри
+            #      supervised(). Застрявший в _pending id больше никогда
+            #      не пройдёт try_claim() — комментарий молча и навсегда
+            #      перестаёт когда-либо отправляться. Теперь claimed_ids
+            #      фиксируется сразу после успешного try_claim (до
+            #      следующего await, который мог бы быть отменён), а
+            #      resolved_ids — только на путях, где уже вызван
+            #      confirm()/release(); в finally релизится разница
+            #      (claimed, но не resolved) при любом выходе из блока,
+            #      включая исключение/отмену на любом шаге. ----
             to_send: list[dict] = []
+            claimed_ids: set[str] = set()
+            resolved_ids: set[str] = set()
             dropped_dup = dropped_rate = 0
-            for p in payloads:
-                if not await seen.try_claim(p["external_id"]):
-                    dropped_dup += 1
-                    continue
-
-                got_token = await _acquire_with_retry(bucket, token_wait_timeout)
-                if not got_token:
-                    await seen.release(p["external_id"])
-                    dropped_rate += 1
-                    continue
-
-                to_send.append(p)
-
             sent = 0
-            if to_send:
-                released_ids: set[str] = set()
-                try:
+
+            try:
+                for p in payloads:
+                    if not await seen.try_claim(p["external_id"]):
+                        dropped_dup += 1
+                        continue
+                    claimed_ids.add(p["external_id"])
+
+                    got_token = await _acquire_with_retry(bucket, token_wait_timeout)
+                    if not got_token:
+                        await seen.release(p["external_id"])
+                        resolved_ids.add(p["external_id"])
+                        dropped_rate += 1
+                        continue
+
+                    to_send.append(p)
+
+                if to_send:
                     ok_flags = await send_batch_to_store(
                         store_session, store_endpoint, to_send, name, batch_max_items
                     )
                     for p, ok in zip(to_send, ok_flags):
                         if ok:
                             await seen.confirm(p["external_id"])
-                            released_ids.add(p["external_id"])
                             sent += 1
                             log.info(
                                 "[%s] OK  %-12s age=%.1fs  %s",
@@ -251,11 +262,16 @@ async def account_worker(
                             )
                         else:
                             await seen.release(p["external_id"])
-                            released_ids.add(p["external_id"])
-                finally:
-                    for p in to_send:
-                        if p["external_id"] not in released_ids:
-                            await seen.release(p["external_id"])
+                        resolved_ids.add(p["external_id"])
+            finally:
+                # Всё, что было заявлено (claimed_ids), но не дошло ни до
+                # confirm(), ни до release() (resolved_ids) на момент
+                # выхода из блока — освобождаем явно. При штатном
+                # прохождении цикла claimed_ids == resolved_ids и это
+                # тело не делает ничего; срабатывает только на
+                # исключении/отмене посреди сбора или отправки.
+                for item_id in claimed_ids - resolved_ids:
+                    await seen.release(item_id)
 
             if sent or dropped_rate or to_send:
                 not_confirmed = len(to_send) - sent

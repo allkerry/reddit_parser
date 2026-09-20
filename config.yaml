@@ -29,9 +29,9 @@ subreddit_ranks_csv: "top_subreddits.csv"
 tier_sizing:
   hot_max_rank: 50
   medium_max_rank: 300
-  hot_group_size: 2
-  medium_group_size: 8
-  cold_group_size: 40
+  hot_group_size: 20
+  medium_group_size: 60
+  cold_group_size: 100
 
 # Стартовый (до адаптации) интервал опроса на группу, по тиру, в
 # секундах. Дальше каждая группа подстраивает свой интервал сама —
@@ -66,7 +66,7 @@ reddit_base_url: "https://www.reddit.com"
 # Сколько комментариев запрашивать у Reddit за один запрос (на группу).
 # Фактическое значение каждый раз джиттерится вниз на 0-15% (см.
 # worker.py) — чтобы запрос не был идентичным каждый раз.
-fetch_limit: 100
+fetch_limit: 500
 
 # Общий джиттер, применяемый поверх итогового рассчитанного интервала
 # сна перед следующим опросом ЭТОЙ группы (адаптивный interval ->
@@ -75,7 +75,7 @@ poll_jitter_ratio: 0.25
 
 # ---- ГЛАВНЫЕ РУЧКИ ПОД ТВОЙ ПАЙПЛАЙН ----
 target_rate_per_second: 25
-max_age_seconds: 100
+max_age_seconds: 120
 # Фактический max_age для КОНКРЕТНОЙ группы — max(max_age_seconds,
 # interval_группы * 1.2), см. worker.py: если группа опрашивается реже,
 # чем max_age_seconds, окно свежести расширяется под неё, иначе
@@ -113,7 +113,7 @@ max_backoff_seconds: 300
 max_consecutive_auth_errors: 5
 
 # Максимальное количество страниц, выкачиваемых за один цикл опроса
-pagination_max_pages: 5
+pagination_max_pages: 3
 
 # Случайная пауза МЕЖДУ запросами отдельных страниц пагинации внутри
 # ОДНОГО цикла опроса одной группы.
