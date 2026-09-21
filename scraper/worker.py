@@ -7,7 +7,7 @@ import aiohttp
 from .config import ConfigStore, CookieFileWatcher
 from .constants import BASE_DIR, DEFAULT_CONNECT_TIMEOUT_SECONDS, PROXY_HOST, STORE_ENDPOINT_OVERRIDE, log
 from .health import ExecutorHandle, ExecutorHealth
-from .http_client import fetch_comments
+from .http_client import CurlSessionHandle, fetch_comments
 from .pipeline import build_payload, send_batch_to_store
 from .state import BackoffState, GroupState, SeenCache, TokenBucket
 
@@ -63,7 +63,18 @@ async def account_worker(
     http_client.py, на каждый отдельный HTTP-запрос, а не один раз тут,
     при старте воркера, — благодаря этому даже долгоживущий воркер,
     который не падал и не перезапускался месяцами, подхватывает новый
-    пул сразу на следующем цикле опроса."""
+    пул сразу на следующем цикле опроса.
+
+    `curl_session` — CurlSessionHandle (scraper/http_client.py), создаётся
+    один раз здесь, при старте воркера, и передаётся в fetch_comments()
+    как есть на каждый цикл: impersonate и proxy_url фиксированы на
+    аккаунт и заданы один раз при создании самого Session внутри
+    CurlSessionHandle._build(), а не передаются отдельными аргументами на
+    каждый отдельный HTTP-запрос (см. docstring CurlSessionHandle и
+    _fetch_comments_page в http_client.py). Если из-за таймаута
+    http_client.py вызовет curl_session.swap() — следующий же запрос
+    этого же воркера (любая его группа) на следующем цикле уйдёт уже в
+    новый, чистый Session, без рестарта самого account_worker."""
     name = account["name"]
     cookie_file = BASE_DIR / account["cookie_file"]
     proxy_port = account["proxy_port"]
@@ -98,6 +109,16 @@ async def account_worker(
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
     }
+
+    # Переиспользуемая curl_cffi.Session на аккаунт (keep-alive TCP/TLS к
+    # Reddit через прокси, см. CurlSessionHandle в http_client.py).
+    # impersonate и proxies фиксированы здесь, один раз на весь срок
+    # жизни воркера — fetch_comments() дальше принимает именно этот
+    # handle, а не голые proxy_url/impersonate на каждый вызов.
+    curl_session = CurlSessionHandle(
+        impersonate=impersonate,
+        proxies={"http": proxy_url, "https": proxy_url},
+    )
 
     backoff = BackoffState(
         base_seconds=config.get("base_backoff_seconds", 5),
@@ -214,8 +235,8 @@ async def account_worker(
                 continue
 
             result = await fetch_comments(
-                session, base_url, subs_joined, fetch_limit_jittered, proxy_url, timeout, name,
-                http_executor, effective_max_age, pagination_max_pages, impersonate, connect_timeout,
+                session, base_url, subs_joined, fetch_limit_jittered, curl_session, timeout, name,
+                http_executor, effective_max_age, pagination_max_pages, connect_timeout,
                 pagination_delay_min, pagination_delay_max, executor_health,
             )
 
