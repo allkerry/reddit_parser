@@ -1,0 +1,56 @@
+# ============================================================
+#  Конфиг scripts/refresh_cookies.py — независимого Playwright-джоба,
+#  который обновляет cookies/account_N.json (см. README.md, раздел
+#  "Обновление cookies: Playwright-джоб + hot-reload").
+#
+#  ВАЖНО: этот файл читается ТОЛЬКО refresh_cookies.py, отдельно от
+#  scraper/config.py:ConfigStore и config.yaml основного скрапера —
+#  компоненты полностью независимы. Если файла нет — используются
+#  дефолты, прописанные прямо в refresh_cookies.py.
+# ============================================================
+
+# false — открыть настоящее окно браузера (удобно для дебага/ручного
+# решения капчи при первом заходе).
+headless: true
+
+# Сколько секунд ждать загрузку страницы / ответ API проверки логина.
+login_check_timeout_seconds: 20
+
+# Пауза между обработкой аккаунтов (не логинить их все одновременно —
+# по аналогии с phase_offset в main.py).
+stagger_seconds: 45
+
+# Куда складывать storage_state/account_N.json Playwright — для
+# переиспользования сессии между запусками джоба, вместо логина с нуля
+# каждый раз. Путь — относительно корня проекта.
+storage_state_dir: "storage_state"
+
+reddit_base_url: "https://www.reddit.com"
+
+# Эндпоинт для проверки залогиненности — ПОЗИТИВНЫЙ признак (ответ с
+# непустым data.name), а не отсутствие формы логина на странице (та
+# может ложно отсутствовать на промежуточных состояниях загрузки).
+# Вынесен сюда отдельной ручкой на случай, если Reddit поменяет API.
+login_check_path: "/api/me.json"
+
+# Гео по умолчанию (locale/timezone/viewport), если для конкретного
+# аккаунта нет записи в account_geo ниже.
+geo_defaults:
+  locale: "en-US"
+  timezone_id: "America/New_York"
+  viewport:
+    width: 1920
+    height: 1080
+
+# Гео per-аккаунт — соответствие локали/таймзоны браузера гео-локации
+# прокси-ноды этого аккаунта (см. accounts.yaml:proxy_port и
+# mihomo_config.yaml). Дефолты ниже соответствуют таблице
+# "Аккаунт -> Нода -> порт" из README на момент написания — поправь под
+# свою реальную раскладку нод, если она отличается.
+account_geo:
+  account_1: {locale: "en-CA", timezone_id: "America/Toronto"}     # Canada
+  account_2: {locale: "ru-RU", timezone_id: "Europe/Moscow"}       # Russia
+  account_3: {locale: "en-US", timezone_id: "America/New_York"}    # USA
+  account_4: {locale: "en-GB", timezone_id: "Europe/London"}       # Great Britain
+  account_5: {locale: "de-DE", timezone_id: "Europe/Berlin"}       # Germany
+  account_6: {locale: "nl-NL", timezone_id: "Europe/Amsterdam"}    # Netherlands

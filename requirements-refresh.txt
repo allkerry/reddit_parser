@@ -1,0 +1,14 @@
+# Зависимости ТОЛЬКО для scripts/refresh_cookies.py — сознательно
+# отдельный файл от requirements.txt основного скрапера (main.py +
+# scraper/): компоненты максимально независимы, падение/зависание
+# этого джоба (или тяжёлые зависимости Playwright) не должны требовать
+# пересборки образа scraper'а.
+#
+# Установка:
+#   python3 -m venv .venv-refresh
+#   .venv-refresh/bin/pip install -r scripts/requirements-refresh.txt
+#   .venv-refresh/bin/playwright install chromium
+
+playwright>=1.40
+playwright-stealth>=1.0.6
+pyyaml>=6.0

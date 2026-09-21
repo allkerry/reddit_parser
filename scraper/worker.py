@@ -4,7 +4,7 @@ import time
 
 import aiohttp
 
-from .config import ConfigStore, load_cookies
+from .config import ConfigStore, CookieFileWatcher
 from .constants import BASE_DIR, DEFAULT_CONNECT_TIMEOUT_SECONDS, PROXY_HOST, STORE_ENDPOINT_OVERRIDE, log
 from .health import ExecutorHandle, ExecutorHealth
 from .http_client import fetch_comments
@@ -41,6 +41,19 @@ async def account_worker(
     interval — это ещё один уровень анти-паттерна поверх джиттера,
     описанного в ARCHITECTURE.md.
 
+    Cookies аккаунта тоже больше не статичны на весь срок жизни воркера:
+    `cookie_file` может обновляться ВНЕШНИМ процессом
+    (scripts/refresh_cookies.py, Playwright-джоб по расписанию, см.
+    README) поверх уже запущенного контейнера. `CookieFileWatcher`
+    (scraper/config.py) дёшево проверяет mtime файла на каждой итерации
+    основного цикла (не чаще `cookie_reload_check_interval_seconds`) и,
+    если файл реально поменялся, перечитывает его и обновляет
+    `session.cookie_jar` — следующий же HTTP-запрос curl_cffi (который
+    берёт cookies прямо из этого jar'а перед отправкой, см.
+    http_client.py) уйдёт уже с новыми cookies, без рестарта воркера.
+    Если джоб не запущен/не настроен — файл просто никогда не меняется,
+    watcher молча ничего не делает, поведение как раньше.
+
     `http_executor` — ExecutorHandle (scraper/health.py), а не голый
     ThreadPoolExecutor: пул под блокирующие вызовы curl_cffi может быть
     пересоздан "на лету" из health_report_loop в main.py, если старый
@@ -64,7 +77,19 @@ async def account_worker(
         log.warning("[%s] нет назначенных сабреддитов (groups пуст) — воркер не запущен", name)
         return
 
-    cookies = load_cookies(cookie_file)
+    # См. CookieFileWatcher в scraper/config.py и docstring выше — тот
+    # же принцип, что у ConfigStore для config.yaml, но на уровне одного
+    # файла cookies/account_N.json и без отдельной фоновой задачи
+    # (проверяется прямо в цикле ниже, вместе с остальным hot-reload
+    # конфига).
+    cookie_watcher = CookieFileWatcher(
+        cookie_file,
+        min_check_interval=config.get("cookie_reload_check_interval_seconds", 30),
+    )
+    cookies = cookie_watcher.load_if_changed(force=True)
+    if cookies is None:
+        log.error("[%s] Не удалось прочитать cookies из %s — воркер не запущен", name, cookie_file)
+        return
 
     user_agent = account.get("user_agent") or config.get("user_agent", "Mozilla/5.0")
     impersonate = account.get("impersonate") or config.get("impersonate", "chrome")
@@ -146,6 +171,22 @@ async def account_worker(
             batch_max_items = config.get("batch_max_items", 500)
             base_url = config.get("reddit_base_url", "https://www.reddit.com")
             adaptive_cfg = config.get("adaptive_scheduling", {})
+
+            # ---- hot-reload cookies (см. CookieFileWatcher выше и
+            #      scripts/refresh_cookies.py) — дёшево (os.stat, не
+            #      чаще min_check_interval), реально читает файл только
+            #      если он поменялся с прошлого раза. Если джоб не
+            #      запущен/не настроен — файл не меняется, тут просто
+            #      ничего не происходит. ----
+            cookie_watcher.min_check_interval = config.get("cookie_reload_check_interval_seconds", 30)
+            new_cookies = cookie_watcher.load_if_changed()
+            if new_cookies is not None:
+                session.cookie_jar.clear()
+                session.cookie_jar.update_cookies(new_cookies)
+                log.info(
+                    "[%s] cookies обновлены из %s (%d шт.) — подхвачены без рестарта воркера",
+                    name, cookie_file, len(new_cookies),
+                )
 
             bucket.update_rate(config.get("target_rate_per_second", 25))
 

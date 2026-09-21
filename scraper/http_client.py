@@ -62,17 +62,69 @@ def parse_ratelimit_headers(resp) -> dict | None:
         return None
 
 
+# ---------------------------------------------------------------- #
+#  Переиспользуемая curl_cffi.Session на аккаунт (keep-alive)
+# ---------------------------------------------------------------- #
+
+class CurlSessionHandle:
+    """Переиспользуемый curl_cffi.requests.Session на аккаунт — TLS/TCP-
+    соединение к Reddit больше не поднимается заново на каждый HTTP-запрос
+    (лишний хендшейк через прокси на каждый цикл опроса, и это же более
+    "ботовый" паттерн — обычный браузер держит соединение открытым).
+    impersonate и proxies фиксированы на аккаунт и задаются один раз при
+    создании Session, а не передаются в каждый отдельный вызов .get().
+
+    Та же опасность, что и с http_executor (см. ExecutorHandle в
+    scraper/health.py, ARCHITECTURE.md §6): asyncio.wait_for() при
+    таймауте не убивает физический поток curl_cffi — если сокет/DNS
+    внутри curl_cffi завис, поток может продолжать держать этот Session
+    сколь угодно долго уже ПОСЛЕ того, как account_worker перестал его
+    ждать снаружи. Поэтому Session нельзя ни мутировать, ни .close()
+    снаружи по таймауту — зависший поток в этот момент может всё ещё
+    читать/писать в тот же объект, и закрытие/переиспользование того же
+    curl-хендла из другого потока — undefined behavior на стороне
+    libcurl (риск порчи состояния соединения или падения потока).
+
+    Вместо этого при таймауте вызывается swap(): .current просто
+    заменяется новым Session, старый явно не закрывается и не трогается —
+    он остаётся жить (вместе со своим возможно ещё занятым сокетом), пока
+    не завершится (или не зависнет навсегда) тот самый поток, после чего
+    будет корректно собран GC как обычный питоновский объект, на который
+    больше никто не держит ссылку.
+
+    Резолвится так же, как ExecutorHandle.current — на каждый отдельный
+    HTTP-запрос в _fetch_comments_page, а не один раз при старте
+    воркера, — благодаря этому даже долгоживущий воркер сразу подхватывает
+    свежий Session на следующем же запросе после swap()."""
+
+    def __init__(self, impersonate: str, proxies: dict | None):
+        self._impersonate = impersonate
+        self._proxies = proxies
+        self.current = self._build()
+        self.swaps = 0
+
+    def _build(self) -> cffi_requests.Session:
+        return cffi_requests.Session(impersonate=self._impersonate, proxies=self._proxies)
+
+    def swap(self):
+        """Заменяет .current на свежий Session. Старый НЕ закрывается
+        явно (см. docstring класса) — просто перестаёт быть чьей-либо
+        заботой, ровно как и зависший поток ThreadPoolExecutor в
+        ExecutorHandle.swap()."""
+        self.current = self._build()
+        self.swaps += 1
+
+
 async def _fetch_comments_page(
     session: aiohttp.ClientSession,
     base_url: str,
     subs_joined: str,
     fetch_limit: int,
-    proxy_url: str,
+    curl_session: CurlSessionHandle,
     timeout: int,
     account_name: str,
     http_executor: ExecutorHandle,
     after: str | None = None,
-    impersonate: str = "chrome",
     connect_timeout: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
     executor_health: ExecutorHealth | None = None,
 ) -> FetchResult:
@@ -94,6 +146,13 @@ async def _fetch_comments_page(
     (который может не перезапускаться неделями) держал бы ссылку на уже
     списанный пул до своего следующего собственного рестарта.
 
+    `curl_session` — CurlSessionHandle (см. выше), а НЕ голая
+    `cffi_requests.Session`/модульная функция `cffi_requests.get`: сессия
+    переиспользуется между вызовами ради keep-alive TCP/TLS-соединения к
+    Reddit через прокси, но может быть пересоздана "на лету" (swap()) при
+    таймауте — резолвим `curl_session.current` здесь же, на каждый
+    отдельный запрос, по той же причине, что и с `http_executor.current`.
+
     `executor_health`, если передан, отслеживает реальную занятость
     ТЕКУЩЕГО пула (см. scraper/health.py) — счётчик инкрементируется
     перед постановкой задачи в пул и декрементируется через
@@ -110,16 +169,19 @@ async def _fetch_comments_page(
     # вытаскиваем из неё вручную и передаём явно.
     cookies = {c.key: c.value for c in session.cookie_jar}
 
+    # .current резолвится именно сейчас (не принимаем сам Session заранее
+    # аргументом функции) — если curl_session.swap() успел произойти
+    # между циклами этого аккаунта (например, из-за таймаута на прошлом
+    # запросе), следующий же запрос уходит сразу в новый, чистый Session,
+    # а не в потенциально всё ещё занятый зависшим потоком старый.
+    curl = curl_session.current
     call = functools.partial(
-        cffi_requests.get,
+        curl.get,
         url,
-        # TLS/JA3- и HTTP2-отпечаток задаётся на аккаунт (accounts.yaml,
-        # ключ impersonate) и остаётся неизменным для этого аккаунта на
-        # всём протяжении его жизни — фиксированная пара с user_agent
-        # ниже, а не случайное значение на каждый запрос (см. README).
-        impersonate=impersonate,
+        # impersonate (TLS/JA3- и HTTP2-отпечаток) и proxies больше не
+        # передаются на каждый вызов — они фиксированы на аккаунт внутри
+        # самого Session при его создании в CurlSessionHandle._build().
         params=params,
-        proxies={"http": proxy_url, "https": proxy_url} if proxy_url else None,
         cookies=cookies,
         # Явная пара (connect_timeout, read_timeout) вместо одного общего
         # timeout=: зависший DNS/TCP/TLS-хендшейк отваливается по
@@ -185,14 +247,29 @@ async def _fetch_comments_page(
         # scraper/health.py: on_future_done для него просто не наступит,
         # active будет расти, и рано или поздно health_report_loop
         # пересоздаст пул целиком).
+        #
+        # Дополнительно: раз поток мог зависнуть именно ВНУТРИ вызова
+        # curl-сессии, дальше этот же Session небезопасно переиспользовать
+        # как ни в чём не бывало — зависший поток потенциально всё ещё
+        # держит его состояние (см. docstring CurlSessionHandle). Поэтому
+        # свопаем сессию аккаунта целиком, а не только логируем таймаут:
+        # старый Session просто перестаёт быть чьей-либо заботой, новый
+        # запрос (эта же или другая группа этого аккаунта) на следующем
+        # цикле уйдёт уже в свежий, точно не занятый Session.
         if executor_health is not None:
             executor_health.on_wait_timeout()
         log.warning(
-            "[%s] Запрос к Reddit не уложился в %.0fs (connect=%.0fs+read=%.0fs+запас) — проверь mihomo/порт",
+            "[%s] Запрос к Reddit не уложился в %.0fs (connect=%.0fs+read=%.0fs+запас) — "
+            "проверь mihomo/порт; пересоздаю curl-сессию аккаунта (старая могла зависнуть "
+            "в фоновом потоке и небезопасна для повторного использования)",
             account_name, total_wait, connect_timeout, timeout,
         )
+        curl_session.swap()
         return FetchResult(error_kind="network")
     except cffi_requests.RequestsError as e:
+        # Поток здесь гарантированно уже завершился (с исключением), а не
+        # завис — Session можно спокойно переиспользовать дальше, swap()
+        # не нужен.
         log.warning("[%s] Ошибка запроса к Reddit (проверь mihomo/порт): %s", account_name, e)
         return FetchResult(error_kind="network")
     except (json.JSONDecodeError, ValueError) as e:
@@ -203,7 +280,9 @@ async def _fetch_comments_page(
         # трактуем как сетевую аномалию и уходим в тот же backoff-путь, что
         # и обычные network-ошибки, вместо падения воркера с необработанным
         # исключением (ValueError — родитель json.JSONDecodeError, ловим оба
-        # на случай нестандартного JSON-парсера внутри curl_cffi).
+        # на случай нестандартного JSON-парсера внутри curl_cffi). Поток и
+        # тут уже завершился штатно (пусть и с "плохим" ответом) — swap()
+        # не требуется.
         log.warning(
             "[%s] Reddit вернул 200, но тело не распарсилось как JSON "
             "(похоже на капчу/интерстишл CDN): %s", account_name, e,
@@ -228,13 +307,12 @@ async def fetch_comments(
     base_url: str,
     subs_joined: str,
     fetch_limit: int,
-    proxy_url: str,
+    curl_session: CurlSessionHandle,
     timeout: int,
     account_name: str,
     http_executor: ExecutorHandle,
     max_age: float,
     max_pages: int,
-    impersonate: str = "chrome",
     connect_timeout: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
     pagination_delay_min: float = 0.0,
     pagination_delay_max: float = 0.0,
@@ -250,6 +328,11 @@ async def fetch_comments(
     docstring _fetch_comments_page выше) — пробрасывается в каждую
     отдельную страницу как есть, .current резолвится уже там, на каждый
     отдельный HTTP-запрос.
+
+    `curl_session` — CurlSessionHandle (см. выше) — так же пробрасывается
+    в каждую отдельную страницу как есть; .current (и возможный swap()
+    при таймауте) резолвится внутри _fetch_comments_page на каждый
+    отдельный запрос, а не один раз здесь.
 
     `pagination_delay_min`/`pagination_delay_max` (сек) — если задан
     ненулевой диапазон, перед КАЖДОЙ страницей, следующей за первой,
@@ -267,8 +350,8 @@ async def fetch_comments(
 
     while True:
         page = await _fetch_comments_page(
-            session, base_url, subs_joined, fetch_limit, proxy_url, timeout,
-            account_name, http_executor, after, impersonate, connect_timeout,
+            session, base_url, subs_joined, fetch_limit, curl_session, timeout,
+            account_name, http_executor, after, connect_timeout,
             executor_health,
         )
 

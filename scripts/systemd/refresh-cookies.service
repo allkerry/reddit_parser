@@ -1,0 +1,32 @@
+# scripts/systemd/refresh-cookies.service
+#
+# Установка:
+#   sudo cp scripts/systemd/refresh-cookies.* /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now refresh-cookies.timer
+#
+# Поправь WorkingDirectory= и путь к venv в ExecStart= под своё
+# развёртывание (см. README.md — venv джоба создаётся отдельно от
+# основного requirements.txt: .venv-refresh).
+#
+# Полностью независим от systemd-юнита/контейнера самого scraper'а —
+# падение этого джоба не влияет на account_worker и наоборот.
+
+[Unit]
+Description=Reddit scraper - обновление cookies (Playwright job)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/reddit-scraper
+ExecStart=/opt/reddit-scraper/.venv-refresh/bin/python3 scripts/refresh_cookies.py
+# Ненулевой exit code (см. refresh_cookies.py: возвращается 1, если
+# хотя бы один аккаунт требует ручного вмешательства) переводит юнит в
+# failed — это видно в `systemctl status refresh-cookies.service` /
+# `journalctl -u refresh-cookies.service` и может быть повешено на
+# внешний мониторинг (email/telegram-нотификация и т.п.).
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target

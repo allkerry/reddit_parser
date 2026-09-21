@@ -107,6 +107,16 @@ request_timeout_seconds: 10
 connect_timeout_seconds: 5
 token_wait_timeout_seconds: 0.5
 
+# Hot-reload cookies (см. scraper/config.py:CookieFileWatcher и
+# scripts/refresh_cookies.py): верхний предел того, КАК ЧАСТО
+# account_worker имеет право дёшево проверять mtime cookie_file на
+# предмет изменений, сделанных внешним Playwright-джобом. Сам файл
+# реально перечитывается ТОЛЬКО если mtime поменялся — это ограничение
+# только на частоту самой проверки (os.stat), а не задержка применения
+# уже обнаруженного обновления. Джоб по умолчанию бежит раз в дни, так
+# что 30с — с большим запасом, а не узкое место.
+cookie_reload_check_interval_seconds: 30
+
 # ---- BACKOFF / RATE-LIMIT ЗАЩИТА ----
 base_backoff_seconds: 5
 max_backoff_seconds: 300
