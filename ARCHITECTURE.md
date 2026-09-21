@@ -28,6 +28,7 @@
      account_worker(acc_1)    account_worker(acc_2)     account_worker(acc_N)
      свой proxy_port,          свой proxy_port,          свой proxy_port,
      свои cookies, UA,         свои cookies, UA,         свои cookies, UA,
+     свой CookieFileWatcher,   свой CookieFileWatcher,   свой CookieFileWatcher,
      свой BackoffState         свой BackoffState         свой BackoffState
               │                        │                        │
               └──────── общий TokenBucket (лимит POST/сек) ──────┘
@@ -36,6 +37,16 @@
               ▼                        ▼                        ▼
         POST /store_items       POST /store_items         POST /store_items
         (батч, через store_session, общий на процесс)
+
+     ┌──────────────────────────────────────────────────────────────┐
+     │  scripts/refresh_cookies.py — ОТДЕЛЬНЫЙ процесс, вне         │
+     │  main.py/asyncio event loop скрапера. По расписанию снаружи  │
+     │  (systemd timer/cron) логинится через тот же proxy_port и    │
+     │  атомарно (os.replace()) перезаписывает cookies/account_N.json│
+     └──────────────────────────────────────────────────────────────┘
+                     │ пишет (атомарно)          │ читает (CookieFileWatcher)
+                     ▼                            ▲
+              cookies/account_N.json ─────────────┘
 ```
 
 Каждый `account_worker` — независимый бесконечный цикл: своя VPN-нода
@@ -53,6 +64,12 @@
 Никакой централизованной очереди между фетчем и отправкой нет: то, что
 `account_worker` вытащил и профильтровал за один цикл опроса, он сам же
 и отправляет в конце того же цикла.
+
+Отдельно от всего этого, вне event loop скрапера, может (опционально)
+работать `scripts/refresh_cookies.py` (см. §10) — он делит с
+`account_worker` только сам файл `cookies/account_N.json`: пишет его
+атомарно, `account_worker` подхватывает изменения через
+`CookieFileWatcher` без рестарта.
 
 ---
 
@@ -91,6 +108,18 @@
   рестарта процесса.
 - `load_cookies(cookie_file)` — превращает экспорт Cookie Editor
   (список объектов с `name`/`value`) в простой `dict`.
+- `CookieFileWatcher` — hot-reload одного `cookie_file` на аккаунт (см.
+  §10 и `scraper/worker.py`). По духу аналог `ConfigStore`, но:
+  - привязан к одному конкретному файлу, а не ко всему конфигу;
+  - не имеет своей фоновой asyncio-задачи — `load_if_changed()`
+    вызывается синхронно прямо из цикла `account_worker`;
+  - дешёвая проверка через `Path.stat().st_mtime`, не чаще
+    `min_check_interval` секунд, а не безусловное чтение файла каждый
+    раз — файл реально читается и парсится ТОЛЬКО если mtime
+    действительно изменился;
+  - ошибки чтения/парсинга (включая теоретическую гонку с частично
+    записанным файлом) не поднимаются наружу — логируются, старые
+    cookies остаются в силе, а не роняют воркер.
 
 ### `scraper/constants.py`
 Пути (`CONFIG_PATH`, `ACCOUNTS_PATH`, с возможностью переопределить через
@@ -98,7 +127,9 @@
 Docker-compose), `PROXY_HOST`, `STORE_ENDPOINT_OVERRIDE` (env
 `STORE_ENDPOINT`, приоритетнее значения из `config.yaml`),
 `SERVER_HARD_BATCH_LIMIT = 1000` (жёсткий потолок сервера для батча),
-таймауты по умолчанию и общий логгер `log`.
+таймауты по умолчанию и общий логгер `log`. Этот же `log`
+переиспользуется в `scripts/refresh_cookies.py` — единый формат логов
+на весь проект, а не два несовместимых.
 
 ### `scraper/models.py`
 `FetchResult` — единственная модель данных, результат одного или
@@ -121,8 +152,11 @@ Docker-compose), `PROXY_HOST`, `STORE_ENDPOINT_OVERRIDE` (env
   `asyncio.wait_for(..., connect_timeout + read_timeout +
   HTTP_EXECUTOR_SLACK_SECONDS)`. Cookies берутся напрямую из
   `aiohttp.ClientSession.cookie_jar` (curl_cffi не умеет работать с
-  `aiohttp.ClientSession` сам). TLS/JA3-отпечаток (`impersonate`)
-  фиксирован на аккаунт. Разбирает статусы: `429` → `error_kind =
+  `aiohttp.ClientSession` сам) — а значит, любое обновление cookie_jar
+  через `CookieFileWatcher` в `account_worker` подхватывается уже
+  следующим же вызовом этой функции, без каких-либо изменений в самом
+  `http_client.py`. TLS/JA3-отпечаток (`impersonate`) фиксирован на
+  аккаунт. Разбирает статусы: `429` → `error_kind =
   "rate_or_server"` (+ `Retry-After`, если есть), `401/403` →
   `error_kind = "auth"`, `5xx`/неожиданный статус → `"rate_or_server"`,
   таймаут/сетевая ошибка/невалидный JSON в теле 200 (капча/интерстишл) →
@@ -216,9 +250,11 @@ Docker-compose), `PROXY_HOST`, `STORE_ENDPOINT_OVERRIDE` (env
 ### `scraper/worker.py`
 Ядро — `account_worker(...)`, бесконечный цикл на один аккаунт:
 
-1. Инициализация: проверка файла cookies, загрузка cookies, выбор
-   `user_agent`/`impersonate` (сначала из `accounts.yaml`, иначе дефолт
-   из `config.yaml`), создание `BackoffState`, сон на `phase_offset`.
+1. Инициализация: проверка файла cookies, создание `CookieFileWatcher`
+   и первая (принудительная, `force=True`) загрузка cookies через него,
+   выбор `user_agent`/`impersonate` (сначала из `accounts.yaml`, иначе
+   дефолт из `config.yaml`), создание `BackoffState`, сон на
+   `phase_offset`.
 2. На каждой итерации цикла — читает актуальные значения из
    `ConfigStore` (hot-reload, поэтому это делается заново каждый раз, а
    не один раз при старте): список сабов, `fetch_limit`, `max_age`,
@@ -227,35 +263,49 @@ Docker-compose), `PROXY_HOST`, `STORE_ENDPOINT_OVERRIDE` (env
    `respect_ratelimit_headers`, `ratelimit_safety_margin`,
    `ratelimit_jitter_ratio`, таймауты, `token_wait_timeout`,
    `store_endpoint` (с приоритетом `STORE_ENDPOINT_OVERRIDE` из env),
-   `batch_max_items`, `reddit_base_url`; обновляет
+   `batch_max_items`, `reddit_base_url`,
+   `cookie_reload_check_interval_seconds`; проверяет
+   `cookie_watcher.load_if_changed()` (см. ниже) и обновляет
    `bucket.update_rate(...)`.
-3. `fetch_comments(...)` (получает в т.ч. `pagination_delay_min/max` —
+3. **Hot-reload cookies**: `cookie_watcher.load_if_changed()` дёшево
+   (`os.stat`, throttled по `cookie_reload_check_interval_seconds`)
+   проверяет, не поменялся ли `cookie_file` с прошлого раза (например,
+   его перезаписал `scripts/refresh_cookies.py`). Если да —
+   `session.cookie_jar.clear()` + `session.cookie_jar.update_cookies(...)`
+   с новым набором cookies; следующий же запрос curl_cffi (который берёт
+   cookies из `session.cookie_jar` непосредственно перед отправкой, см.
+   `http_client.py`) уйдёт уже с обновлёнными. Если файл не менялся —
+   `load_if_changed()` возвращает `None`, ничего не происходит.
+4. `fetch_comments(...)` (получает в т.ч. `pagination_delay_min/max` —
    см. `http_client.py` выше) → при `error_kind`:
    - `"rate_or_server"` → backoff, `continue` (без похода к остальным
      шагам цикла);
    - `"auth"` → backoff, при исчерпании лимита — `return` (воркер
      полностью останавливается, но `supervised()` его не перезапускает,
-     т.к. это штатный `return`, а не исключение);
+     т.к. это штатный `return`, а не исключение). Это тот самый сигнал,
+     по которому стоит проверить, не пропустил ли
+     `scripts/refresh_cookies.py` этот аккаунт как разлогиненный (ERROR
+     в его собственном логе);
    - `"network"` → более мягкий backoff, ограниченный `poll_interval * 3`
      сверху (сетевые сбои не должны так же сильно тормозить, как явный
      рейт-лимит).
-4. Успех → `backoff.register_success()`, затем для каждого комментария:
+5. Успех → `backoff.register_success()`, затем для каждого комментария:
    `build_payload` → отбросить, если `_age_seconds > max_age` → собрать
    `payloads`, отсортировать по `_age_seconds` (сначала самые свежие).
-5. Для каждого payload по порядку свежести: `seen.try_claim` (иначе —
+6. Для каждого payload по порядку свежести: `seen.try_claim` (иначе —
    дубль, пропуск) → `_acquire_with_retry(bucket, token_wait_timeout)`
    (короткий поллинг токена; не дождались — `seen.release()` и пропуск) →
    добавить в `to_send`.
-6. Если `to_send` не пуст — `send_batch_to_store(...)` внутри `try/finally`:
+7. Если `to_send` не пуст — `send_batch_to_store(...)` внутри `try/finally`:
    по каждому результату `True/False` — `confirm()`/`release()`
    соответственно; `finally` дополнительно освобождает (`release`) любой
    id из `to_send`, который почему-то не попал ни в один из путей выше
    (необработанное исключение внутри `send_batch_to_store` или
    `CancelledError` посреди `zip`-цикла) — иначе такой id завис бы в
    `_pending` навсегда и перестал бы когда-либо считаться дублем/свободным.
-7. Логирование сводки цикла (получено/свежих/к_отправке/отправлено/
+8. Логирование сводки цикла (получено/свежих/к_отправке/отправлено/
    не_подтверждено/дублей/срезано_лимитом).
-8. Расчёт сна до следующего цикла:
+9. Расчёт сна до следующего цикла:
    - база — `poll_interval * max(1, pages_fetched)` (если пагинация
      забрала несколько страниц, промежуток перед следующим циклом растёт
      пропорционально, чтобы не увеличивать эффективную частоту запросов);
@@ -288,11 +338,20 @@ Docker-compose), `PROXY_HOST`, `STORE_ENDPOINT_OVERRIDE` (env
 `iso_utc(ts)` — Unix-time → ISO 8601 UTC строка с микросекундами и
 суффиксом `Z`.
 
+### `scripts/refresh_cookies.py`
+См. §10 ниже — независимый Playwright-джоб, единственная точка
+пересечения с остальным кодом — файл `cookies/account_N.json` (плюс
+чтение `accounts.yaml` тем же `load_accounts()`, что и `main.py`).
+
 ---
 
 ## 3. Поток одного цикла опроса (сводно)
 
 ```
+проверить cookie_watcher.load_if_changed() -> обновить session.cookie_jar,
+если cookies/account_N.json изменился извне (scripts/refresh_cookies.py)
+        │
+        ▼
 fetch_comments (пагинация, до pagination_max_pages,
                 со случайной паузой pagination_delay_min..max
                 между страницей N и N+1)
@@ -340,7 +399,7 @@ send_batch_to_store(to_send) — чанками по batch_max_items
 | Общее на процесс                          | Своё на аккаунт                        |
 |--------------------------------------------|------------------------------------------|
 | `TokenBucket` (суммарный лимит отправки)   | proxy (`proxy_port` → своя VPN-нода)     |
-| `SeenCache` (дедуп по всем аккаунтам)      | cookies                                   |
+| `SeenCache` (дедуп по всем аккаунтам)      | cookies + `CookieFileWatcher`             |
 | `ConfigStore` (один источник конфига)      | `user_agent` + `impersonate` (TLS-отпечаток) |
 | `ThreadPoolExecutor` (пул под curl_cffi)   | `BackoffState` (свои счётчики ошибок)    |
 | `aiohttp.ClientSession` в store_endpoint   | фаза опроса (`phase_offset`)             |
@@ -404,6 +463,12 @@ send_batch_to_store(to_send) — чанками по batch_max_items
    и корректно освободиться сам — это не "убивает" запрос, а лишь не даёт
    ему держать asyncio-цикл воркера.
 
+Отдельно от этого пула, `scripts/refresh_cookies.py` использует
+Playwright (свой собственный, синхронный процесс браузера) — он не
+делит `http_executor` со скрапером и не подвержен той же проблеме
+(таймауты Playwright закрывают контекст/браузер целиком, а не оставляют
+висящий поток в общем пуле).
+
 ---
 
 ## 7. Дедуп и надёжность доставки
@@ -432,12 +497,19 @@ send_batch_to_store(to_send) — чанками по batch_max_items
 рестарта процесса — `account_worker` каждую итерацию цикла читает
 актуальные значения через `config.get(...)`. `accounts.yaml`, наоборот,
 читается один раз в `main.py` до старта задач — включение новых
-аккаунтов или смена cookie-файлов требует рестарта процесса/контейнера.
+аккаунтов или смена cookie-файла (пути к нему) требует рестарта
+процесса/контейнера.
+
+Cookies конкретного, уже включённого аккаунта (содержимое файла,
+на который уже указывает `cookie_file`) — отдельный, более лёгкий
+случай: `CookieFileWatcher` в `account_worker` (см. §2/§9/§10)
+перечитывает его на лету, рестарт для этого не нужен.
 
 Переменные окружения (`CONFIG_PATH`, `ACCOUNTS_PATH`, `PROXY_HOST`,
-`STORE_ENDPOINT`, `CONFIG_RELOAD_SECONDS`) позволяют докер-compose файлам
-переопределять пути и адреса без правки самого `config.yaml` — см.
-`docker-compose.yml`/`docker-compose.bridge.yml`.
+`STORE_ENDPOINT`, `CONFIG_RELOAD_SECONDS`, `REFRESH_COOKIES_CONFIG`)
+позволяют докер-compose файлам/systemd-юнитам переопределять пути и
+адреса без правки самих yaml-файлов — см. `docker-compose.yml`/
+`docker-compose.bridge.yml` и `scripts/systemd/`.
 
 ---
 
@@ -460,8 +532,87 @@ send_batch_to_store(to_send) — чанками по batch_max_items
    `account_worker`) — финальный сон варьируется независимо от того,
    на основе чего был посчитан `adjusted_interval` (статичный
    `poll_interval` или ratelimit-адаптация).
+5. **Пауза между аккаунтами в `scripts/refresh_cookies.py`**
+   (`stagger_seconds`) — тот же принцип, что и `phase_offset` выше, но
+   для джоба обновления сессии: аккаунты не логинятся/подтверждают
+   сессию все разом.
 
 Уровни 3 и 4 применяются последовательно (сначала внутри
 ratelimit-расчёта, потом ещё раз ко всему интервалу), поэтому итоговый
 эффект — не единственный плоский джиттер, а комбинация из двух
 независимых случайных множителей.
+
+---
+
+## 10. Обновление cookies: независимый Playwright-джоб + hot-reload
+
+Полная инструкция и примеры команд — в README.md ("Обновление cookies:
+Playwright-джоб + hot-reload"). Здесь — только архитектурно важные
+моменты.
+
+### Два независимых компонента
+
+- **Компонент А** — `scripts/refresh_cookies.py`. Отдельный процесс, вне
+  `main.py`/asyncio event loop скрапера. Читает `accounts.yaml` тем же
+  `load_accounts()`, что и `main.py`, логинится/подтверждает сессию
+  Playwright-браузером через тот же `proxy_port`, что и сам скрапер для
+  этого аккаунта, и **атомарно** (`os.replace()`) перезаписывает
+  `cookies/account_N.json` в формате, который уже понимает
+  `scraper.config.load_cookies()`. Персистентность между запусками —
+  через `storage_state/account_N.json` (полный снэпшот
+  Playwright-контекста, не только cookies). Работает по расписанию
+  снаружи (systemd timer/cron, см. `scripts/systemd/`) — сам скрипт
+  расписание не хранит, один запуск = один полный прогон по всем
+  аккаунтам.
+- **Компонент Б** — `CookieFileWatcher` внутри `account_worker` (см. §2,
+  §3, §9). Не пишет в `cookies/account_N.json`, только читает — hot-reload
+  без рестарта.
+
+Единственная точка пересечения — сам файл `cookies/account_N.json`.
+Компонент А пишет, компонент Б читает. Ничего больше между ними не
+общее: у компонента А свой процесс/интерпретатор, свои зависимости
+(Playwright — не тянутся в основной `requirements.txt`/образ scraper'а),
+своё расписание; падение или зависание компонента А не мешает
+`account_worker` работать дальше на текущих (пусть и стареющих) cookies,
+а отсутствие/выключенность компонента Б просто означает возврат к
+старому поведению — обновлять cookies нужно руками и с рестартом
+контейнера.
+
+### Почему атомарная запись обязательна
+
+`account_worker` читает `cookie_file` из отдельного, конкурентного (по
+отношению к джобу) процесса — если бы запись шла напрямую
+(`open(path, "w")` + построчная запись), `CookieFileWatcher` мог бы в
+теории поймать файл в момент, когда старое содержимое уже частично
+затёрто, а новое ещё не дописано (усечённый/невалидный JSON). Запись во
+временный файл в той же директории (`.account_N.json.tmp`) с последующим
+`os.replace()` на целевой путь атомарна на уровне файловой системы (POSIX
+rename) — `account_worker` в любой момент видит либо полностью старое,
+либо полностью новое содержимое, никогда — промежуточное. Тот же принцип
+применяется и к `storage_state/account_N.json`.
+
+### Почему прокси-порт должен совпадать
+
+`account_worker` для аккаунта `account_1` всегда ходит на Reddit через
+`http://{PROXY_HOST}:7891` (см. `accounts.yaml`). Если бы
+`refresh_cookies.py` логинился без прокси или через другой порт, Reddit
+увидел бы для одной и той же сессии/cookies два разных исходных IP почти
+одновременно — для антибот-эвристик Reddit это существенно более
+подозрительный паттерн, чем стабильный IP на аккаунт (см. также §9 —
+весь остальной анти-детект в проекте построен вокруг той же идеи: один
+аккаунт = один стабильный "цифровой след"). Поэтому `proxy_port` в
+`accounts.yaml` — это ровно тот же источник истины и для скрапера, и для
+джоба обновления cookies.
+
+### Проверка залогиненности
+
+Намеренно НЕ по отсутствию формы логина на странице: она может ложно
+отсутствовать на промежуточных состояниях загрузки (SPA ещё не
+дорендерился, редирект в процессе и т.п.), что дало бы
+ложноположительный "залогинен" и джоб перезаписал бы рабочие cookies
+пустой/битой сессией. Вместо этого — позитивный признак: успешный ответ
+авторизованного API-эндпоинта Reddit (`/api/me.json`, путь вынесен в
+конфиг `login_check_path`, чтобы его было легко поправить при редизайне
+API). Если признака нет — `cookies/account_N.json` не трогается вообще,
+инцидент только логируется (ERROR) и учитывается в итоговом exit
+code/сводке прогона.

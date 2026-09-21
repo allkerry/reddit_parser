@@ -18,20 +18,32 @@
 ├── scraper/
 │   ├── __init__.py
 │   ├── constants.py          # пути, таймауты, логгер, константы
-│   ├── config.py             # ConfigStore (hot-reload config.yaml), load_accounts/load_cookies
+│   ├── config.py             # ConfigStore (hot-reload config.yaml), CookieFileWatcher
+│   │                          # (hot-reload cookies/account_N.json), load_accounts/load_cookies
 │   ├── models.py             # FetchResult
 │   ├── http_client.py        # запрос к Reddit (curl_cffi) + пагинация (с паузами между страницами)
 │   ├── pipeline.py           # payload из комментария Reddit + батч-отправка в store_items
-│   ├── state.py              # TokenBucket, SeenCache (claim/confirm/release), BackoffState
+│   ├── state.py               # TokenBucket, SeenCache (claim/confirm/release), BackoffState
+│   ├── grouping.py           # раскладка сабов между аккаунтами + группировка по тирам
+│   ├── health.py             # мониторинг/своп http_executor (зависшие потоки curl_cffi)
 │   └── worker.py             # account_worker (основной цикл на аккаунт), supervised()
+├── scripts/
+│   ├── refresh_cookies.py           # независимый Playwright-джоб: обновляет cookies/*.json
+│   ├── requirements-refresh.txt     # зависимости ТОЛЬКО этого джоба (playwright и т.п.)
+│   └── systemd/                     # systemd timer/service для планового запуска джоба
+│       ├── refresh-cookies.service
+│       └── refresh-cookies.timer
 ├── config.yaml                # тюнинг: target_rate, max_age, очередь, сабы...
 ├── accounts.yaml              # 6 слотов аккаунтов, cookie_file + proxy_port
+├── refresh_cookies.yaml       # конфиг Playwright-джоба (headless, гео per-аккаунт, ...)
 ├── mihomo_config.yaml         # 6 VPN-нод, каждая на своём локальном порту
-├── cookies/account_N.json     # cookies аккаунтов (Cookie Editor export)
+├── cookies/account_N.json     # cookies аккаунтов (Cookie Editor export) — обновляются
+│                                # вручную ИЛИ автоматически через scripts/refresh_cookies.py
+├── storage_state/account_N.json  # persist-сессии Playwright между запусками джоба
 ├── Dockerfile                 # образ main.py + пакет scraper/
 ├── docker-compose.yml         # Linux: mihomo + scraper, network_mode: host
 ├── docker-compose.bridge.yml  # Mac/Windows: bridge-сеть + host.docker.internal
-├── requirements.txt
+├── requirements.txt           # зависимости ТОЛЬКО main.py/scraper/ (без playwright)
 └── .gitignore / .dockerignore
 ```
 
@@ -111,7 +123,10 @@ target_rate=... max_age=...`).
 
 А вот `accounts.yaml` (включение новых аккаунтов, смена cookie-файлов)
 читается один раз при старте процесса — после правки нужен
-`docker compose restart scraper`.
+`docker compose restart scraper`. Сам же **файл cookies одного уже
+включённого аккаунта** (`cookies/account_N.json`) теперь тоже
+подхватывается на лету — см. раздел "Обновление cookies" ниже, рестарт
+контейнера для этого больше не обязателен.
 
 ---
 
@@ -199,6 +214,11 @@ python3 main.py
   заголовкам мог давать "круглые" интервалы (например ровно 4.0с), что
   само по себе предсказуемый паттерн; с джиттером получается что-то вроде
   3.26с/4.01с и т.д. Поставь `0`, чтобы отключить.
+- `cookie_reload_check_interval_seconds` — верхний предел частоты, с
+  которой `account_worker` проверяет mtime `cookie_file` на предмет
+  изменений извне (см. раздел "Обновление cookies" ниже). Файл реально
+  перечитывается только если действительно поменялся — это ограничение
+  только на частоту самой проверки (дефолт 30с).
 
 ## Логи
 
@@ -223,6 +243,8 @@ Backoff-события (при ошибках Reddit) и предупрежде�
 логируются отдельными строками — см. `ARCHITECTURE.md` за деталями по каждому
 типу ошибки. Паузы между страницами пагинации логируются на уровне `DEBUG`
 (`пауза %.2fs перед стр.N пагинации`) — не видны при обычном уровне `INFO`.
+Обновление cookies "на лету" (см. ниже) логируется отдельной строкой INFO:
+`[account_1] cookies обновлены из cookies/account_1.json (14 шт.) — подхвачены без рестарта воркера`.
 
 ## Защита от рейт-лимита / банов
 
@@ -252,6 +274,9 @@ Backoff-события (при ошибках Reddit) и предупрежде�
 - **Отдельная обработка 401/403**: если у аккаунта подряд
   `max_consecutive_auth_errors` (дефолт 5) неудачных попыток — воркер
   останавливается совсем с понятным ERROR в логе ("обнови cookies").
+- **Playwright-джоб обновления сессии через тот же прокси-порт**, что и
+  сам скрапер (см. "Обновление cookies" ниже) — снижает вероятность
+  дожить до протухания cookies до самого 401/403.
 - Опция переключиться на `old.reddit.com` через `reddit_base_url` в
   `config.yaml`, если у него окажется отдельный/мягче рейт-лимит.
 
@@ -259,6 +284,118 @@ Backoff-события (при ошибках Reddit) и предупрежде�
 с датацентровых IP в принципе замечаем современными антибот-системами.
 Если увидишь в логах регулярные `backoff` — это сигнал снизить
 `target_rate_per_second`/увеличить `poll_interval_seconds`, а не игнорировать.
+
+## Обновление cookies: Playwright-джоб + hot-reload
+
+Cookies (`cookies/account_N.json`) экспортируются вручную (Cookie
+Editor) и со временем протухают — раньше единственный способ обновить их
+был: руками пересоздать файл и `docker compose restart scraper`. Теперь
+это можно (частично) автоматизировать двумя независимыми друг от друга
+компонентами.
+
+### Компонент А — `scripts/refresh_cookies.py`
+
+Отдельный скрипт на Playwright (**не** часть `main.py`/event loop
+скрапера — запускается отдельно, по расписанию снаружи, см. ниже). За
+один запуск, для каждого `enabled: true` аккаунта из `accounts.yaml`:
+
+1. поднимает браузерный контекст через **тот же** `proxy_port`, что и
+   сам скрапер для этого аккаунта (mihomo) — логин с одного IP и
+   дальнейшие запросы с другого резко повышают риск бана;
+2. переиспользует сохранённую с прошлого раза Playwright-сессию
+   (`storage_state/account_N.json`), либо конвертирует на лету текущий
+   `cookies/account_N.json`, если сохранённой сессии ещё нет;
+3. проверяет залогиненность по позитивному признаку — ответу
+   авторизованного API-эндпоинта Reddit (`/api/me.json`), а не по
+   отсутствию формы логина (та может ложно отсутствовать на
+   промежуточных состояниях загрузки страницы);
+4. если разлогинены — **не трогает** существующий `cookies/account_N.json`,
+   логирует ERROR и переходит к следующему аккаунту. Логин по паролю
+   этот скрипт не автоматизирует (высокий риск капчи/детекта на
+   датацентровом IP) — это ручная операция;
+5. если залогинены — сохраняет `storage_state/account_N.json` (для
+   переиспользования в следующий раз) и атомарно (`os.replace()`)
+   перезаписывает `cookies/account_N.json` в том же формате, который
+   уже понимает `scraper.config.load_cookies()`;
+6. сверяет фактический `navigator.userAgent` браузера с
+   `accounts.yaml:user_agent` этого аккаунта — при расхождении WARNING
+   в лог (сам `accounts.yaml` не трогает — `user_agent`/`impersonate`
+   правится руками).
+
+Использует stealth-меры (`playwright-stealth`, либо ручной fallback
+через `add_init_script`, если библиотека не установлена) и
+локаль/таймзону/viewport по гео прокси-ноды аккаунта (см.
+`refresh_cookies.yaml:account_geo` — дефолты соответствуют нодам из
+таблицы "Аккаунт -> Нода -> порт" выше, поправь под свою
+`mihomo_config.yaml`, если ноды другие).
+
+Возвращает ненулевой exit code, если хотя бы один аккаунт разлогинен и
+требует ручного вмешательства — удобно вешать на cron/systemd-мониторинг.
+
+**Установка** (отдельно от основного `requirements.txt` — компоненты
+максимально независимы, падение/зависание этого джоба не должно
+требовать пересборки образа scraper'а):
+
+```bash
+python3 -m venv .venv-refresh
+.venv-refresh/bin/pip install -r scripts/requirements-refresh.txt
+.venv-refresh/bin/playwright install chromium
+```
+
+**Ручной запуск**:
+
+```bash
+.venv-refresh/bin/python3 scripts/refresh_cookies.py                  # все enabled-аккаунты
+.venv-refresh/bin/python3 scripts/refresh_cookies.py --account account_1
+.venv-refresh/bin/python3 scripts/refresh_cookies.py --no-headless    # с окном браузера, для дебага
+.venv-refresh/bin/python3 scripts/refresh_cookies.py --dry-run        # без реальной записи файлов
+```
+
+Конфиг — `refresh_cookies.yaml` в корне проекта (см. сам файл за
+дефолтами и комментариями): `headless`, `login_check_timeout_seconds`,
+`stagger_seconds` (пауза между аккаунтами — не логинить их всех разом),
+`storage_state_dir`, `account_geo`. Опционально можно вместо отдельного
+файла держать те же ключи в секции `refresh_cookies:` внутри общего
+`config.yaml` — скрипт это тоже понимает.
+
+**Расписание** — по умолчанию раз в 7 дней; скрипт сам себя не
+планирует (`main.py` тут ни при чём — один запуск = один полный прогон
+по всем аккаунтам, дальше решает планировщик снаружи). Выбранный в этом
+репозитории вариант — systemd timer (`scripts/systemd/`):
+
+```bash
+sudo cp scripts/systemd/refresh-cookies.* /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now refresh-cookies.timer
+# поправь OnCalendar= в refresh-cookies.timer под нужный интервал,
+# WorkingDirectory=/ExecStart= в refresh-cookies.service — под свой путь
+# и venv (см. .venv-refresh выше).
+```
+
+Альтернатива — обычный cron:
+
+```
+0 3 * * 0 cd /opt/reddit-scraper && .venv-refresh/bin/python3 scripts/refresh_cookies.py >> /var/log/reddit-scraper-refresh-cookies.log 2>&1
+```
+
+### Компонент Б — hot-reload cookies в `account_worker`
+
+Раньше `cookies/account_N.json` читался ровно один раз при старте
+`account_worker` — обновление файла (в т.ч. джобом выше) требовало
+`docker compose restart scraper`. Теперь `account_worker` каждую
+итерацию своего цикла дёшево (`os.stat`, не чаще
+`cookie_reload_check_interval_seconds`, дефолт 30с — см. `config.yaml`)
+проверяет mtime файла и, если он реально поменялся, перечитывает его и
+обновляет `session.cookie_jar` — следующий же запрос к Reddit уйдёт уже
+с новыми cookies, без рестарта воркера/контейнера. См.
+`scraper/config.py:CookieFileWatcher` и `ARCHITECTURE.md`.
+
+Если компонент А (джоб) не запущен/не настроен — компонент Б просто
+никогда не видит изменений файла и ничего не делает: обновлять cookies
+по-прежнему можно руками (как раньше), поведение не меняется.
+
+`storage_state/` (как и `cookies/`) содержит по сути живые сессионные
+данные — в `.gitignore` уже добавлено, в репозиторий не коммитится.
 
 ## Известные ограничения / на что смотреть
 
@@ -268,7 +405,9 @@ Backoff-события (при ошибках Reddit) и предупрежде�
 - `401`/`403` в логах конкретного аккаунта = протухли cookies или бан —
   worker этого аккаунта просто перестаёт слать данные, остальные
   продолжают работать. В Docker это будет видно через
-  `docker compose logs -f scraper`.
+  `docker compose logs -f scraper`. Регулярные 401/403 несмотря на
+  еженедельный прогон `scripts/refresh_cookies.py` — сигнал проверить
+  ERROR-логи джоба (сессия разлогинена и требует ручного логина заново).
 - Дедуп-кэш (`seen_cache_size`, сейчас 1000) — только в памяти процесса,
   общий на все аккаунты. При рестарте контейнера/процесса обнуляется (так
   и задумано).
@@ -290,3 +429,9 @@ Backoff-события (при ошибках Reddit) и предупрежде�
 - `docker-compose.yml` тянет `metacubex/mihomo:latest` — если нужна
   конкретная зафиксированная версия для повторяемых сборок, скажи, подставлю
   тег вместо `latest`.
+- `scripts/refresh_cookies.py` не автоматизирует первичный логин по
+  паролю (см. раздел "Обновление cookies" выше) — если у аккаунта ещё
+  никогда не было ни `cookies/account_N.json`, ни
+  `storage_state/account_N.json`, первый заход нужно сделать руками
+  (`--no-headless`, залогиниться в открывшемся окне, дальше джоб сам
+  сохранит сессию для последующих прогонов).
