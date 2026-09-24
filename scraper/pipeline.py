@@ -26,6 +26,23 @@ def build_payload(comment_data: dict) -> dict | None:
     parent_id = comment_data.get("parent_id", "") or ""
     external_parent_id = parent_id if parent_id.startswith("t1_") else ""
 
+    # communityName в формате "r/<sub>", как в примере с дашборда
+    # (Exorde ожидает summary.communityName именно с префиксом "r/").
+    subreddit = comment_data.get("subreddit") or ""
+    community_name = f"r/{subreddit}" if subreddit else ""
+
+    # summary — компактная JSON-строка с метаданными поста/комментария.
+    # upvote_ratio и num_comments у Reddit есть только у постов (t3_),
+    # не у комментариев (t1_) — для комментария оставляем их пустыми,
+    # а не подставляем выдуманные значения.
+    summary = json.dumps({
+        "score": str(comment_data.get("score", "")),
+        "upvote_ratio": "",
+        "num_comments": "",
+        "communityName": community_name,
+        "data_type": "comment",
+    })
+
     return {
         "content": body,
         "external_id": fullname,
@@ -36,6 +53,7 @@ def build_payload(comment_data: dict) -> dict | None:
         "author": author,
         "username": author,
         "external_parent_id": external_parent_id,
+        "summary": summary,
         "_age_seconds": time.time() - created_utc,
     }
 
