@@ -23,8 +23,15 @@ def build_payload(comment_data: dict) -> dict | None:
     permalink = comment_data.get("permalink", "")
     url = f"https://www.reddit.com{permalink}" if permalink else ""
 
+    # Exorde-правило для Reddit: external_parent_id указывает либо на
+    # родительский пост (t3_...), либо на родительский комментарий
+    # (t1_...) — раньше top-level комментарии (parent = пост, t3_)
+    # получали пустую строку, что давало неполную схему и риск отсева/
+    # понижения quality score. Теперь оба префикса сохраняются как есть;
+    # всё остальное (пусто, мусор, неожиданный префикс) — по-прежнему "".
+    # Ничего не выдумываем, если Reddit сам не отдал parent_id.
     parent_id = comment_data.get("parent_id", "") or ""
-    external_parent_id = parent_id if parent_id.startswith("t1_") else ""
+    external_parent_id = parent_id if parent_id.startswith(("t1_", "t3_")) else ""
 
     # communityName в формате "r/<sub>", как в примере с дашборда
     # (Exorde ожидает summary.communityName именно с префиксом "r/").
