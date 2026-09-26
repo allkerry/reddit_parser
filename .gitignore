@@ -5,3 +5,4 @@ storage_state/.*.tmp
 __pycache__/
 *.pyc
 mihomo_config.yaml
+vless_accounts.env

@@ -2,41 +2,34 @@ accounts:
   - name: account_1
     enabled: true
     cookie_file: cookies/account_1.json
-    proxy_port: 7891
-    impersonate: chrome131
-    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    proxy_port: 7892
+    impersonate: firefox147       # Самый свежий Firefox из вашего списка
+    user_agent: "Mozilla/5.0 (X11; Linux x86_64; rv:156.0) Gecko/20100101 Firefox/156.0"
 
   - name: account_2
-    enabled: false
+    enabled: true
     cookie_file: cookies/account_2.json
-    proxy_port: 7892
-    impersonate: safari180
-    user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
+    proxy_port: 7891
+    impersonate: firefox144       # Чуть более старый Firefox (отлично подходит под имитацию ESR)
+    user_agent: "Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0"
 
   - name: account_3
-    enabled: false
+    enabled: true
     cookie_file: cookies/account_3.json
     proxy_port: 7893
-    impersonate: firefox133
-    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0"
+    impersonate: chrome150        # Самый свежий десктопный Chrome из списка
+    user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
 
   - name: account_4
-    enabled: false
+    enabled: true
     cookie_file: cookies/account_4.json
     proxy_port: 7894
-    impersonate: chrome124
-    user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    impersonate: chrome150        # Аналогично для второго Chrome-аккаунта
+    user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
 
   - name: account_5
-    enabled: false
+    enabled: true
     cookie_file: cookies/account_5.json
     proxy_port: 7895
-    impersonate: chrome136
-    user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
-
-  - name: account_6
-    enabled: false
-    cookie_file: cookies/account_6.json
-    proxy_port: 7896
-    impersonate: chrome145
-    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+    impersonate: safari260_ios    # Свежий мобильный Safari, идеально под iOS 18+
+    user_agent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6.1 Mobile/15E148 Safari/604.1"

@@ -36,7 +36,9 @@
 ├── config.yaml                # тюнинг: target_rate, max_age, очередь, сабы...
 ├── accounts.yaml              # 6 слотов аккаунтов, cookie_file + proxy_port
 ├── refresh_cookies.yaml       # конфиг Playwright-джоба (headless, гео per-аккаунт, ...)
-├── mihomo_config.yaml         # 6 VPN-нод, каждая на своём локальном порту
+├── vless_accounts.env         # account_N = vless://... (правишь руками)
+├── scripts/generate_mihomo_config.py  # собирает mihomo_config.yaml из vless_accounts.env
+├── mihomo_config.yaml         # СГЕНЕРИРОВАН скриптом выше — не редактируй руками
 ├── cookies/account_N.json     # cookies аккаунтов (Cookie Editor export) — обновляются
 │                                # вручную ИЛИ автоматически через scripts/refresh_cookies.py
 ├── storage_state/account_N.json  # persist-сессии Playwright между запусками джоба
@@ -139,6 +141,12 @@ pip install -r requirements.txt
 Понадобится бинарник **mihomo** (Clash.Meta core):
 https://github.com/MetaCubeX/mihomo/releases
 
+Перед первым запуском (и при каждом изменении `vless_accounts.env`)
+сгенерируй `mihomo_config.yaml`:
+```bash
+python3 scripts/generate_mihomo_config.py
+```
+
 Терминал 1 — прокси:
 ```bash
 mihomo -f mihomo_config.yaml
@@ -151,16 +159,46 @@ python3 main.py
 
 ---
 
-## Таблица аккаунт -> нода -> порт
+## Проброс аккаунтов через VLESS-подписку (вместо статичных нод mihomo)
 
-| Аккаунт    | Нода          | Локальный порт | Статус на старте |
-|------------|---------------|-----------------|-------------------|
-| account_1  | Canada        | 7891            | enabled (cookies есть) |
-| account_2  | Russia        | 7892            | disabled (нет cookies) |
-| account_3  | USA           | 7893            | disabled |
-| account_4  | Great Britain | 7894            | disabled |
-| account_5  | Germany       | 7895            | disabled |
-| account_6  | Netherlands   | 7896            | disabled |
+Каждый аккаунт ходит в Reddit через свой локальный порт mihomo
+(`proxy_port` в `accounts.yaml`), а mihomo уже сам решает, через какую
+реальную VPN-ноду этот порт выпускать трафик наружу. Чтобы привязать
+ноду из своей VLESS-подписки к конкретному аккаунту, ничего не нужно
+трогать в Python-коде — правится только один файл:
+
+`vless_accounts.env`:
+```
+account_1 = vless://uuid@host:port?...#de2.trust.zone
+account_2 = vless://uuid@host:port?...#in1.trust.zone
+account_3 = vless://uuid@host:port?...#us7.trust.zone
+```
+
+После правки — пересобрать `mihomo_config.yaml`:
+```bash
+python3 scripts/generate_mihomo_config.py
+docker compose restart mihomo   # или просто mihomo -f mihomo_config.yaml, если без Docker
+```
+
+Скрипт сам подставит `proxy_port` из `accounts.yaml` для каждого
+`account_N`, распарсит vless-ссылку (uuid/сервер/tls/httpupgrade/ws/grpc
+и т.д.) и пересоберёт секции `proxies` / `proxy-groups` / `listeners`.
+Аккаунты, для которых в `vless_accounts.env` нет строки, останутся без
+прокси — скрипт выведет об этом предупреждение в консоль.
+
+Список нод из подписки Trust.Zone можно посмотреть/обновить по ссылке
+вида `https://trustzone.live/get_subscription_data.php?u=...&c=...&s=vless`
+(там будет строка с несколькими `vless://...`, каждую — в свою строку
+`account_N = ...`).
+
+| Аккаунт    | Локальный порт (из accounts.yaml) |
+|------------|-------------------------------------|
+| account_1  | 7892 |
+| account_2  | 7891 |
+| account_3  | 7893 |
+| account_4  | 7894 |
+| account_5  | 7895 |
+| account_6  | 7896 |
 
 ## Добавление остальных аккаунтов
 
@@ -325,9 +363,8 @@ Editor) и со временем протухают — раньше единс�
 Использует stealth-меры (`playwright-stealth`, либо ручной fallback
 через `add_init_script`, если библиотека не установлена) и
 локаль/таймзону/viewport по гео прокси-ноды аккаунта (см.
-`refresh_cookies.yaml:account_geo` — дефолты соответствуют нодам из
-таблицы "Аккаунт -> Нода -> порт" выше, поправь под свою
-`mihomo_config.yaml`, если ноды другие).
+`refresh_cookies.yaml:account_geo` — поправь под геолокацию тех нод,
+что реально прописаны в твоём `vless_accounts.env`, если она другая).
 
 Возвращает ненулевой exit code, если хотя бы один аккаунт разлогинен и
 требует ручного вмешательства — удобно вешать на cron/systemd-мониторинг.

@@ -75,7 +75,7 @@ poll_jitter_ratio: 0.25
 
 # ---- ГЛАВНЫЕ РУЧКИ ПОД ТВОЙ ПАЙПЛАЙН ----
 target_rate_per_second: 25
-max_age_seconds: 150
+max_age_seconds: 60
 # Фактический max_age для КОНКРЕТНОЙ группы — max(max_age_seconds,
 # interval_группы * 1.2), см. worker.py: если группа опрашивается реже,
 # чем max_age_seconds, окно свежести расширяется под неё, иначе
@@ -123,7 +123,7 @@ max_backoff_seconds: 300
 max_consecutive_auth_errors: 5
 
 # Максимальное количество страниц, выкачиваемых за один цикл опроса
-pagination_max_pages: 5
+pagination_max_pages: 2
 
 # Случайная пауза МЕЖДУ запросами отдельных страниц пагинации внутри
 # ОДНОГО цикла опроса одной группы.
