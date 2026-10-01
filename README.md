@@ -1,0 +1,612 @@
+# Reddit fresh-comments scraper
+
+Опрашивает список сабреддитов через `www.reddit.com/r/.../comments.json`
+(авторизованно, через cookies) с нескольких аккаунтов параллельно, каждый —
+через свой VPN-выход (своя нода из твоей подписки), и льёт свежие
+комментарии в локальный пайплайн (`POST /store_items`, батчами) с общим
+управляемым рейт-лимитом.
+
+Подробное описание того, как это устроено внутри (потоки данных,
+дедуп, backoff, батчинг, работа с блокирующим `curl_cffi`) — в
+[ARCHITECTURE.md](./ARCHITECTURE.md).
+
+## Структура
+
+```
+.
+├── main.py                   # точка входа: конфиг, общие объекты, запуск воркеров
+├── scraper/
+│   ├── __init__.py
+│   ├── constants.py          # пути, таймауты, логгер, константы
+│   ├── config.py             # ConfigStore (hot-reload config.yaml), CookieFileWatcher
+│   │                          # (hot-reload cookies/account_N.json), load_accounts/load_cookies
+│   ├── models.py             # FetchResult
+│   ├── http_client.py        # запрос к Reddit (curl_cffi) + пагинация (с паузами между страницами)
+│   ├── pipeline.py           # payload из комментария Reddit + батч-отправка в store_items
+│   ├── state.py               # TokenBucket, SeenCache (claim/confirm/release), BackoffState
+│   ├── grouping.py           # раскладка сабов между аккаунтами + группировка по тирам
+│   ├── health.py             # мониторинг/своп http_executor (зависшие потоки curl_cffi)
+│   └── worker.py             # account_worker (основной цикл на аккаунт), supervised()
+├── scripts/
+│   ├── refresh_cookies.py           # компонент А: логин-джоб, обновляет cookies/*.json
+│   ├── refresh_cookies.yaml         # его конфиг (headless, гео per-аккаунт, ...)
+│   ├── refresh_guest_cookies.py     # компонент Б: гостевой (без логина) джоб
+│   ├── refresh_guest_cookies.yaml   # его конфиг (guest_accounts: engine/channel/UA/impersonate)
+│   ├── generate_mihomo_config.py    # собирает mihomo_config.yaml из vless_accounts.env
+│   ├── requirements-refresh.txt     # зависимости ТОЛЬКО этих джобов (playwright, curl_cffi)
+│   └── systemd/                     # systemd timer/service для планового запуска джобов
+│       ├── refresh-cookies.service / .timer
+│       └── refresh-guest-cookies.service / .timer
+├── config.yaml                # тюнинг: target_rate, max_age, очередь, сабы...
+├── accounts.yaml              # 9 слотов: account_1..6 (логин) + account_7..9 (гостевые)
+├── vless_accounts.env         # account_N = vless://... (правишь руками)
+├── mihomo_config.yaml         # СГЕНЕРИРОВАН scripts/generate_mihomo_config.py — не редактируй руками
+├── cookies/account_N.json     # cookies аккаунтов (Cookie Editor export) — обновляются
+│                                # вручную ИЛИ автоматически (компонент А или Б, см. ниже)
+├── storage_state/account_N.json  # persist-сессии Playwright между запусками компонента А
+├── Dockerfile                 # образ main.py + пакет scraper/
+├── docker-compose.yml         # Linux: mihomo + scraper, network_mode: host
+├── docker-compose.bridge.yml  # Mac/Windows: bridge-сеть + host.docker.internal
+├── requirements.txt           # зависимости ТОЛЬКО main.py/scraper/ (без playwright)
+└── .gitignore / .dockerignore
+```
+
+> **Проверь при обновлении:** `Dockerfile` и `docker-compose*.yml` должны
+> копировать/запускать `main.py` (а не старый монолитный `scraper.py`) и
+> ссылаться на батчевый эндпойнт `/store_items` (а не одиночный
+> `/store_item`) в `STORE_ENDPOINT`/`store_endpoint`. Если у тебя в репозитории
+> ещё остались старые значения — поправь их вручную перед сборкой образа,
+> иначе контейнер не стартует или будет слать данные не туда.
+
+---
+
+## Архитектура — коротко
+
+Каждый аккаунт — это независимый воркер (`account_worker`), который за один
+цикл опроса:
+
+1. тянет у Reddit одну или несколько страниц `comments.json` (пагинация,
+   пока свежих комментариев больше, чем помещается в `fetch_limit`, — между
+   страницами пагинации внутри одного цикла делается случайная пауза,
+   см. `pagination_delay_min_seconds`/`pagination_delay_max_seconds` ниже);
+2. фильтрует по `max_age_seconds` и сортирует от самых свежих к старым;
+3. дедуплицирует через общий (на все аккаунты) `SeenCache`;
+4. забирает токены из общего `TokenBucket` (`target_rate_per_second` —
+   это ручка на **все** аккаунты сразу, а не на каждый по отдельности);
+5. шлёт то, что прошло 3–4, одним батч-POST в `/store_items` (список
+   пейлоадов, а не по одному запросу на комментарий).
+
+Никакой отдельной общей очереди-хипа и выделенной корутины-отправителя на
+весь процесс сейчас нет — каждый воркер аккаунта сам доходит до отправки.
+Общие для всех аккаунтов вещи — это **только** `TokenBucket` (лимит
+скорости отправки) и `SeenCache` (дедуп), они передаются в каждый
+`account_worker` при старте в `main.py`. Полное описание — в
+[ARCHITECTURE.md](./ARCHITECTURE.md).
+
+---
+
+## Вариант 1: Docker (рекомендуется)
+
+### Linux
+
+```bash
+docker compose up -d --build
+docker compose logs -f scraper
+```
+
+`docker-compose.yml` поднимает оба контейнера в `network_mode: host`, поэтому
+scraper видит порты mihomo (`127.0.0.1:7891-7915`, 25 аккаунтов) и локальный пайплайн
+(`127.0.0.1:9000/store_items`) на хосте без дополнительной настройки сети.
+
+### Mac / Windows (Docker Desktop)
+
+`network_mode: host` там не работает как на Linux, поэтому используй bridge-вариант:
+
+```bash
+docker compose -f docker-compose.bridge.yml up -d --build
+docker compose -f docker-compose.bridge.yml logs -f scraper
+```
+
+Здесь scraper обращается к mihomo по DNS-имени контейнера (`PROXY_HOST=mihomo`),
+а к пайплайну на хосте — через `host.docker.internal` (прописано в
+`environment:` этого файла — проверь, что `STORE_ENDPOINT` там указывает
+на `/store_items`, а не на старый одиночный `/store_item`).
+
+### Остановка / рестарт
+
+```bash
+docker compose down
+docker compose restart scraper   # если поменял accounts.yaml (новые аккаунты)
+```
+
+**Важно:** `config.yaml` (target_rate, max_age, сабы, fetch_limit,
+poll_interval, batch_max_items и т.д.) **перечитывается на лету каждые
+5 секунд** — просто правишь файл на хосте, рестарт контейнера не нужен,
+изменения подхватятся сами (это видно в логах: `config.yaml обновлён:
+target_rate=... max_age=...`).
+
+А вот `accounts.yaml` (включение новых аккаунтов, смена cookie-файлов)
+читается один раз при старте процесса — после правки нужен
+`docker compose restart scraper`. Сам же **файл cookies одного уже
+включённого аккаунта** (`cookies/account_N.json`) теперь тоже
+подхватывается на лету — см. раздел "Обновление cookies" ниже, рестарт
+контейнера для этого больше не обязателен.
+
+---
+
+## Вариант 2: без Docker, локально
+
+```bash
+pip install -r requirements.txt
+```
+
+Понадобится бинарник **mihomo** (Clash.Meta core):
+https://github.com/MetaCubeX/mihomo/releases
+
+Перед первым запуском (и при каждом изменении `vless_accounts.env`)
+сгенерируй `mihomo_config.yaml`:
+```bash
+python3 scripts/generate_mihomo_config.py
+```
+
+Терминал 1 — прокси:
+```bash
+mihomo -f mihomo_config.yaml
+```
+
+Терминал 2 — скрапер:
+```bash
+python3 main.py
+```
+
+---
+
+## Проброс аккаунтов через VLESS-подписку (вместо статичных нод mihomo)
+
+Каждый аккаунт ходит в Reddit через свой локальный порт mihomo
+(`proxy_port` в `accounts.yaml`), а mihomo уже сам решает, через какую
+реальную VPN-ноду этот порт выпускать трафик наружу. Чтобы привязать
+ноду из своей VLESS-подписки к конкретному аккаунту, ничего не нужно
+трогать в Python-коде — правится только один файл:
+
+`vless_accounts.env`:
+```
+account_1 = vless://uuid@host:port?...
+account_2 = vless://uuid@host:port?...
+account_3 = vless://uuid@host:port?...
+```
+
+После правки — пересобрать `mihomo_config.yaml`:
+```bash
+python3 scripts/generate_mihomo_config.py
+docker compose restart mihomo   # или просто mihomo -f mihomo_config.yaml, если без Docker
+```
+
+Скрипт сам подставит `proxy_port` из `accounts.yaml` для каждого
+`account_N`, распарсит vless-ссылку (uuid/сервер/tls/httpupgrade/ws/grpc
+и т.д.) и пересоберёт секции `proxies` / `proxy-groups` / `listeners`.
+Аккаунты, для которых в `vless_accounts.env` нет строки, останутся без
+прокси — скрипт выведет об этом предупреждение в консоль.
+
+| Аккаунт    | Локальный порт (из accounts.yaml) |
+|------------|-------------------------------------|
+| account_1  | 7892 |
+| account_2  | 7891 |
+| account_3  | 7893 |
+| account_4  | 7894 |
+| account_5  | 7895 |
+| account_6  | 7896 |
+| account_7  | 7897 |
+| account_8  | 7898 |
+| account_9  | 7899 |
+| account_10 | 7900 |
+| account_11 | 7901 |
+| account_12 | 7902 |
+| account_13 | 7903 |
+| account_14 | 7904 |
+| account_15 | 7905 |
+| account_16 | 7906 |
+| account_17 | 7907 |
+| account_18 | 7908 |
+| account_19 | 7909 |
+| account_20 | 7910 |
+| account_21 | 7911 |
+| account_22 | 7912 |
+| account_23 | 7913 |
+| account_24 | 7914 |
+| account_25 | 7915 |
+
+Актуальный, точный источник соответствия аккаунт -> порт -> нода —
+вывод `python3 scripts/generate_mihomo_config.py` (см. выше), таблица
+здесь — просто справочная.
+
+## Добавление остальных аккаунтов
+
+1. Экспортируй cookies (Cookie Editor -> Export -> JSON) для нужного
+   аккаунта, сохрани как `cookies/account_2.json` (и т.д.) — лишние поля
+   экспорта скрипт сам игнорирует, важны только `name`/`value`.
+2. В `accounts.yaml` поставь этому аккаунту `enabled: true`.
+3. `docker compose restart scraper` (или просто перезапусти `python3 main.py`
+   при локальном запуске). mihomo трогать не нужно — все 6 портов уже подняты.
+
+## Тюнинг под нагрузку пайплайна
+
+Всё — в `config.yaml`, подхватывается автоматически (см. выше про hot-reload):
+
+- `target_rate_per_second` — общий (на все аккаунты сразу) лимит того,
+  сколько элементов в секунду уходит в `store_items` через общий
+  `TokenBucket`. Смотришь логи пайплайна -> крутишь это значение.
+- `max_age_seconds` — фильтр свежести: комментарии старше этого возраста
+  на момент цикла опроса отбрасываются ещё до дедупа и отправки, в
+  очередь/батч не попадают вовсе.
+- `batch_max_items` — максимум айтемов в одном POST `/store_items` за раз
+  (сервер отклоняет батчи больше `BATCH_MAX_ITEMS`, у коллектора дефолт
+  1000, — держим свой лимит с запасом ниже серверного).
+- `token_wait_timeout_seconds` — сколько воркер аккаунта готов ждать
+  свободный токен из общего `TokenBucket`, прежде чем отказаться от
+  отправки конкретного комментария в этом цикле (он не потеряется
+  навсегда — просто не уйдёт с этим циклом опроса, если он ещё не
+  протухнет по `max_age_seconds`, его подхватят на следующем цикле).
+- `subreddits` — список сабов (сейчас первые 20+ из top_subreddits.csv).
+- `fetch_limit` — сколько комментариев запрашивать у Reddit за один
+  запрос (сейчас 100 — подтверждённый максимум для этого эндпоинта).
+- `pagination_max_pages` — потолок числа страниц `comments.json`,
+  выкачиваемых за один цикл опроса одного аккаунта.
+- `pagination_delay_min_seconds` / `pagination_delay_max_seconds` —
+  диапазон случайной паузы МЕЖДУ запросами отдельных страниц пагинации
+  внутри одного цикла опроса (стр.1 -> пауза -> стр.2 -> пауза -> стр.3...).
+  Не влияет на самый первый запрос цикла — только на переходы между уже
+  начавшейся пагинацией. Значение каждый раз выбирается заново через
+  `random.uniform(min, max)`. Поставь оба в `0` (или `max` в `0`), чтобы
+  вернуть старое поведение — страницы без пауз подряд.
+- `poll_interval_seconds` — как часто **каждый** аккаунт дёргает Reddit.
+  Эффективная частота опроса всего списка сабов = это значение делить на
+  число активных аккаунтов (они идут со сдвигом по фазе). Реальный сон
+  между циклами дополнительно адаптируется под `X-Ratelimit-*` заголовки
+  Reddit (если он их присылает) и джиттерится `poll_jitter_ratio`.
+- `ratelimit_jitter_ratio` — доп. джиттер (по умолчанию ±15%), который
+  накладывается прямо на интервал, вычисленный из
+  `X-Ratelimit-Remaining`/`X-Ratelimit-Reset` (`reset / (remaining *
+  ratelimit_safety_margin)`), — до того, как поверх ещё раз применится
+  общий `poll_jitter_ratio` на весь итоговый сон. Без этого сам расчёт по
+  заголовкам мог давать "круглые" интервалы (например ровно 4.0с), что
+  само по себе предсказуемый паттерн; с джиттером получается что-то вроде
+  3.26с/4.01с и т.д. Поставь `0`, чтобы отключить.
+- `cookie_reload_check_interval_seconds` — верхний предел частоты, с
+  которой `account_worker` проверяет mtime `cookie_file` на предмет
+  изменений извне (см. раздел "Обновление cookies" ниже). Файл реально
+  перечитывается только если действительно поменялся — это ограничение
+  только на частоту самой проверки (дефолт 30с).
+
+## Логи
+
+Fetch + отправка, на каждый цикл аккаунта:
+```
+[account_1] цикл: получено=87 свежих=54 к_отправке=41 отправлено=39 не_подтверждено=2 дублей=13 срезано_лимитом=0
+```
+- `получено` — сколько всего комментариев вернул Reddit за цикл (все страницы);
+- `свежих` — сколько прошло фильтр `max_age_seconds`;
+- `к_отправке` — сколько прошло дедуп (`SeenCache.try_claim`) и получило
+  токен из общего `TokenBucket`;
+- `отправлено` — реально подтверждено сервером (`/store_items` вернул ok);
+- `не_подтверждено` — ушло в батч, но сервер не подтвердил сохранение
+  (батч/элемент вернулись с ошибкой) — claim в `SeenCache` для них снят,
+  на следующем цикле опроса они снова доступны для отправки;
+- `дублей` — не прошли `try_claim` (уже подтверждённо отправлены или
+  прямо сейчас отправляются другим воркером);
+- `срезано_лимитом` — не дождались свободного токена за
+  `token_wait_timeout_seconds`.
+
+Backoff-события (при ошибках Reddit) и предупреждения о статусе батч-отправки
+логируются отдельными строками — см. `ARCHITECTURE.md` за деталями по каждому
+типу ошибки. Паузы между страницами пагинации логируются на уровне `DEBUG`
+(`пауза %.2fs перед стр.N пагинации`) — не видны при обычном уровне `INFO`.
+Обновление cookies "на лету" (см. ниже) логируется отдельной строкой INFO:
+`[account_1] cookies обновлены из cookies/account_1.json (14 шт.) — подхвачены без рестарта воркера`.
+
+## Защита от рейт-лимита / банов
+
+По результатам реальных прогонов добавлено:
+
+- **Exponential backoff** при 429/5xx/сетевых ошибках:
+  `base_backoff_seconds * 2^(подряд ошибок)`, потолок `max_backoff_seconds`,
+  плюс случайный джиттер. Если Reddit прислал `Retry-After` — используется
+  он, если он больше расчётного backoff. Пока идёт backoff, аккаунт **не
+  делает новых запросов вообще**.
+- **Адаптация по `X-Ratelimit-Remaining`/`X-Ratelimit-Reset`** (если Reddit
+  их присылает) — интервал опроса может быть увеличен сверх
+  `poll_interval_seconds`, если заголовки говорят, что текущий темп не
+  продержится до конца окна. Никогда не уменьшает интервал ниже
+  сконфигурированного. Сам расчётный интервал дополнительно джиттерится
+  через `ratelimit_jitter_ratio` (±15% по умолчанию), чтобы не выходить
+  на "круглые" значения вроде ровно 4.0с.
+- **Джиттер обычного интервала** (`poll_jitter_ratio`, дефолт ±25%) —
+  паттерн запросов не идеально ровный "тик-так". Применяется поверх всего
+  итогового расчёта интервала сна, включая ratelimit-адаптацию выше.
+- **Случайные паузы между страницами пагинации** одного цикла
+  (`pagination_delay_min_seconds`/`pagination_delay_max_seconds`, дефолт
+  0.4–1.5с) — раньше страницы уходили одна за другой без задержки вообще,
+  что было ровным, предсказуемым паттерном само по себе.
+- **Реалистичные User-Agent** и зафиксированный TLS/JA3-отпечаток
+  (`impersonate`) по одному на аккаунт (`accounts.yaml`).
+- **Отдельная обработка 401/403**: если у аккаунта подряд
+  `max_consecutive_auth_errors` (дефолт 5) неудачных попыток — воркер
+  останавливается совсем с понятным ERROR в логе ("обнови cookies").
+- **Playwright-джоб обновления сессии через тот же прокси-порт**, что и
+  сам скрапер (см. "Обновление cookies" ниже) — снижает вероятность
+  дожить до протухания cookies до самого 401/403.
+- Опция переключиться на `old.reddit.com` через `reddit_base_url` в
+  `config.yaml`, если у него окажется отдельный/мягче рейт-лимит.
+
+Это снижает риск, но не убирает его до нуля — многоаккаунтовый скрейпинг
+с датацентровых IP в принципе замечаем современными антибот-системами.
+Если увидишь в логах регулярные `backoff` — это сигнал снизить
+`target_rate_per_second`/увеличить `poll_interval_seconds`, а не игнорировать.
+
+## Обновление cookies: Playwright-джоб + hot-reload
+
+Cookies (`cookies/account_N.json`) экспортируются вручную (Cookie
+Editor) и со временем протухают — раньше единственный способ обновить их
+был: руками пересоздать файл и `docker compose restart scraper`. Теперь
+это можно (частично) автоматизировать двумя независимыми друг от друга
+компонентами.
+
+### Компонент А — `scripts/refresh_cookies.py`
+
+Отдельный скрипт на Playwright (**не** часть `main.py`/event loop
+скрапера — запускается отдельно, по расписанию снаружи, см. ниже). За
+один запуск, для каждого `enabled: true` аккаунта из `accounts.yaml`:
+
+1. поднимает браузерный контекст через **тот же** `proxy_port`, что и
+   сам скрапер для этого аккаунта (mihomo) — логин с одного IP и
+   дальнейшие запросы с другого резко повышают риск бана;
+2. переиспользует сохранённую с прошлого раза Playwright-сессию
+   (`storage_state/account_N.json`), либо конвертирует на лету текущий
+   `cookies/account_N.json`, если сохранённой сессии ещё нет;
+3. проверяет залогиненность по позитивному признаку — ответу
+   авторизованного API-эндпоинта Reddit (`/api/me.json`), а не по
+   отсутствию формы логина (та может ложно отсутствовать на
+   промежуточных состояниях загрузки страницы);
+4. если разлогинены — **не трогает** существующий `cookies/account_N.json`,
+   логирует ERROR и переходит к следующему аккаунту. Логин по паролю
+   этот скрипт не автоматизирует (высокий риск капчи/детекта на
+   датацентровом IP) — это ручная операция;
+5. если залогинены — сохраняет `storage_state/account_N.json` (для
+   переиспользования в следующий раз) и атомарно (`os.replace()`)
+   перезаписывает `cookies/account_N.json` в том же формате, который
+   уже понимает `scraper.config.load_cookies()`;
+6. сверяет фактический `navigator.userAgent` браузера с
+   `accounts.yaml:user_agent` этого аккаунта — при расхождении WARNING
+   в лог (сам `accounts.yaml` не трогает — `user_agent`/`impersonate`
+   правится руками).
+
+Использует stealth-меры (`playwright-stealth`, либо ручной fallback
+через `add_init_script`, если библиотека не установлена) и
+локаль/таймзону/viewport по гео прокси-ноды аккаунта (см.
+`refresh_cookies.yaml:account_geo` — поправь под геолокацию тех нод,
+что реально прописаны в твоём `vless_accounts.env`, если она другая).
+
+Возвращает ненулевой exit code, если хотя бы один аккаунт разлогинен и
+требует ручного вмешательства — удобно вешать на cron/systemd-мониторинг.
+
+**Установка** (отдельно от основного `requirements.txt` — компоненты
+максимально независимы, падение/зависание этого джоба не должно
+требовать пересборки образа scraper'а):
+
+```bash
+python3 -m venv .venv-refresh
+.venv-refresh/bin/pip install -r scripts/requirements-refresh.txt
+.venv-refresh/bin/playwright install chromium
+```
+
+**Ручной запуск**:
+
+```bash
+.venv-refresh/bin/python3 scripts/refresh_cookies.py                  # все enabled-аккаунты
+.venv-refresh/bin/python3 scripts/refresh_cookies.py --account account_1
+.venv-refresh/bin/python3 scripts/refresh_cookies.py --no-headless    # с окном браузера, для дебага
+.venv-refresh/bin/python3 scripts/refresh_cookies.py --dry-run        # без реальной записи файлов
+```
+
+Конфиг — `scripts/refresh_cookies.yaml` (см. сам файл за дефолтами и
+комментариями): `headless`, `login_check_timeout_seconds`,
+`stagger_seconds` (пауза между аккаунтами — не логинить их всех разом),
+`storage_state_dir`, `account_geo`. Опционально можно вместо отдельного
+файла держать те же ключи в секции `refresh_cookies:` внутри общего
+`config.yaml` — скрипт это тоже понимает.
+
+**Расписание** — по умолчанию раз в 7 дней; скрипт сам себя не
+планирует (`main.py` тут ни при чём — один запуск = один полный прогон
+по всем аккаунтам, дальше решает планировщик снаружи). Выбранный в этом
+репозитории вариант — systemd timer (`scripts/systemd/`):
+
+```bash
+sudo cp scripts/systemd/refresh-cookies.* /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now refresh-cookies.timer
+# поправь OnCalendar= в refresh-cookies.timer под нужный интервал,
+# WorkingDirectory=/ExecStart= в refresh-cookies.service — под свой путь
+# и venv (см. .venv-refresh выше).
+```
+
+Альтернатива — обычный cron:
+
+```
+0 3 * * 0 cd /opt/reddit-scraper && .venv-refresh/bin/python3 scripts/refresh_cookies.py >> /var/log/reddit-scraper-refresh-cookies.log 2>&1
+```
+
+### Компонент Б — `scripts/refresh_guest_cookies.py` (гостевые cookies без логина)
+
+С мая 2026 Reddit блокирует `.json` вообще без cookies (403), но не
+требует именно авторизованного логина — анонимной ("гостевой") сессии
+достаточно: один раз зайти на `reddit.com` настоящим браузером (тот сам
+проходит анти-бот JS-проверку) и переиспользовать выставленные
+Reddit'ом cookies. Этот компонент автоматизирует именно такой, без
+логина в реальный аккаунт, вариант — отдельными "гостевыми" слотами
+(`account_7`/`8`/`9` уже заведены в `accounts.yaml`, но `enabled: false`
+и без VLESS-ноды, пока сам их не допишешь).
+
+За один запуск для каждого слота из `guest_accounts`
+(`scripts/refresh_guest_cookies.yaml`):
+
+1. поднимает Playwright browser context — движок (`chromium`/`firefox`/
+   `webkit`), опционально `channel` (`chrome`/`msedge` — настоящий
+   канал, не bundled-движок), `user_agent` и **соответствующий**
+   `impersonate` curl_cffi **зафиксированы на слот** в конфиге, а не
+   выбираются на лету — TLS/JA3-отпечаток, которым реально идут
+   `comments.json`-запросы (curl_cffi), должен совпадать с тем
+   "браузером", который эти cookies получил;
+2. заходит на `reddit_base_url` через **тот же** `proxy_port`, что и
+   сам скрапер для этого аккаунта (та же VLESS-нода, тот же IP и на
+   выдаче cookies, и на их последующем использовании);
+3. ждёт `networkidle` + паузу `post_load_settle_seconds` (часть cookies
+   антибот доставляет через JS уже после первой отрисовки), с
+   ретраями (`warmup_retries`) на случай нестабильной ноды;
+4. забирает cookies контекста, оставляет только домен `reddit.com`
+   (отбрасывает нерелевантные вроде `g_state` — артефакт Google
+   Identity Services);
+5. **верифицирует** результат реальным запросом к
+   `/r/{verify_subreddit}/comments.json` тем же `impersonate`/прокси,
+   что у слота — `cookies/account_N.json` перезаписывается **только**
+   если ответ 200;
+6. если верификация не прошла — существующий файл **не трогает**,
+   логирует ERROR, ненулевой exit code (как и у компонента А).
+
+Гостевая сессия не переиспускается между запусками (в отличие от
+`storage_state` у компонента А) — каждый прогон харвестит набор cookies
+заново с нуля, это устойчивее для короткоживущей анонимной сессии.
+
+**В любой момент времени жив максимум один браузерный процесс** —
+слоты обрабатываются строго последовательно (`browser.close()`
+предыдущего раньше, чем `launch()` следующего), специально под
+ограниченные ресурсы хоста — параллельные Chromium/Firefox/WebKit
+легко кладут небольшую VPS в OOM.
+
+**Установка** (тот же venv, что у компонента А — см.
+`scripts/requirements-refresh.txt`, добавлен `curl_cffi` для шага
+верификации):
+
+```bash
+python3 -m venv .venv-refresh
+.venv-refresh/bin/pip install -r scripts/requirements-refresh.txt
+.venv-refresh/bin/playwright install --with-deps chromium firefox
+# нужно только для слотов с channel: chrome / channel: msedge:
+.venv-refresh/bin/playwright install chrome msedge
+```
+
+Либо, если предпочитаешь системные пакеты вместо `playwright install`
+(например, канал `msedge` не через Playwright, а через официальный
+apt-репозиторий Microsoft):
+
+```bash
+# Google Chrome
+sudo apt install -y wget gnupg
+wget -qO- https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+sudo apt update && sudo apt install -y google-chrome-stable
+
+# Microsoft Edge
+wget -qO- https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-edge.gpg
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-edge.gpg] https://packages.microsoft.com/repos/edge stable main" | sudo tee /etc/apt/sources.list.d/microsoft-edge.list
+sudo apt update && sudo apt install -y microsoft-edge-stable
+```
+
+Playwright с `channel="chrome"`/`channel="msedge"` сам находит системную
+установку — отдельно ничего конфигурировать не нужно.
+
+**Ручной запуск**:
+
+```bash
+.venv-refresh/bin/python3 scripts/refresh_guest_cookies.py                   # все гостевые слоты
+.venv-refresh/bin/python3 scripts/refresh_guest_cookies.py --account account_7
+.venv-refresh/bin/python3 scripts/refresh_guest_cookies.py --no-headless     # с окном браузера, для дебага
+.venv-refresh/bin/python3 scripts/refresh_guest_cookies.py --dry-run         # без реальной записи файлов
+```
+
+Конфиг — `scripts/refresh_guest_cookies.yaml` (сам файл — за дефолтами,
+комментариями и таблицей `guest_accounts`). **Важно**: `user_agent`/
+`impersonate` там должны совпадать 1:1 с тем, что прописано этому же
+`account_N` в `accounts.yaml`.
+
+**Расписание** — интервал **меньше TTL самой короткоживущей гостевой
+cookie** (`session_tracker`, ~2 часа), с запасом. В этом репозитории —
+systemd timer каждые 75 минут (`scripts/systemd/`):
+
+```bash
+sudo cp scripts/systemd/refresh-guest-cookies.* /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now refresh-guest-cookies.timer
+```
+
+Полностью независим от `refresh-cookies.timer` (компонент А) — но оба
+джоба используют браузер, поэтому на слабом хосте не стоит запускать их
+одновременно (см. `RandomizedDelaySec` в обоих `.timer`).
+
+**Первый запуск для нового слота** — после того как впишешь VLESS-ссылку
+в `vless_accounts.env` и перегенеришь `mihomo_config.yaml`
+(см. раздел выше):
+
+```bash
+python3 scripts/generate_mihomo_config.py
+docker compose restart mihomo
+.venv-refresh/bin/python3 scripts/refresh_guest_cookies.py --account account_7
+# если в логе "cookies обновлены... верификация OK" — можно enabled: true в accounts.yaml
+```
+
+### Компонент В — hot-reload cookies в `account_worker`
+
+Раньше `cookies/account_N.json` читался ровно один раз при старте
+`account_worker` — обновление файла (в т.ч. джобом выше) требовало
+`docker compose restart scraper`. Теперь `account_worker` каждую
+итерацию своего цикла дёшево (`os.stat`, не чаще
+`cookie_reload_check_interval_seconds`, дефолт 30с — см. `config.yaml`)
+проверяет mtime файла и, если он реально поменялся, перечитывает его и
+обновляет `session.cookie_jar` — следующий же запрос к Reddit уйдёт уже
+с новыми cookies, без рестарта воркера/контейнера. См.
+`scraper/config.py:CookieFileWatcher` и `ARCHITECTURE.md`.
+
+Если ни компонент А, ни компонент Б не запущены/не настроены — компонент
+В просто никогда не видит изменений файла и ничего не делает: обновлять
+cookies по-прежнему можно руками (как раньше), поведение не меняется.
+
+`storage_state/` (как и `cookies/`) содержит по сути живые сессионные
+данные — в `.gitignore` уже добавлено, в репозиторий не коммитится.
+
+## Известные ограничения / на что смотреть
+
+- Reddit может отдавать `429` при слишком частых запросах — если видишь
+  это в логах, увеличивай `poll_interval_seconds` или сокращай список
+  сабов на аккаунт.
+- `401`/`403` в логах конкретного аккаунта = протухли cookies или бан —
+  worker этого аккаунта просто перестаёт слать данные, остальные
+  продолжают работать. В Docker это будет видно через
+  `docker compose logs -f scraper`. Регулярные 401/403 несмотря на
+  еженедельный прогон `scripts/refresh_cookies.py` — сигнал проверить
+  ERROR-логи джоба (сессия разлогинена и требует ручного логина заново).
+- Дедуп-кэш (`seen_cache_size`, сейчас 1000) — только в памяти процесса,
+  общий на все аккаунты. При рестарте контейнера/процесса обнуляется (так
+  и задумано).
+- Если `store_items` регулярно возвращает `не_подтверждено > 0` в логах —
+  смотри `ошибок_отправки`/warning-строки от `pipeline.py`: либо пайплайн
+  недоступен/подтормаживает, либо `batch_max_items` слишком большой для
+  сервера (проверь ответ `413`).
+- Паузы между страницами пагинации (`pagination_delay_*`) увеличивают
+  фактическую длительность цикла опроса для аккаунтов, которым нужно
+  несколько страниц — это уже учтено в расчёте следующего интервала сна
+  (`elapsed`, см. `account_worker`), так что эффективная частота опроса
+  не растёт сама по себе, просто цикл с пагинацией занимает больше
+  реального времени.
+- Если `mihomo` без поддержки `listeners` (старая версия) — нужно
+  поднимать 6 отдельных инстансов mihomo с 6 отдельными конфигами вместо
+  одного файла со списком `listeners`. Скажи, если версия не потянет —
+  подготовлю такой вариант (и под Docker тоже, отдельным сервисом на
+  каждую ноду).
+- `docker-compose.yml` тянет `metacubex/mihomo:latest` — если нужна
+  конкретная зафиксированная версия для повторяемых сборок, скажи, подставлю
+  тег вместо `latest`.
+- `scripts/refresh_cookies.py` не автоматизирует первичный логин по
+  паролю (см. раздел "Обновление cookies" выше) — если у аккаунта ещё
+  никогда не было ни `cookies/account_N.json`, ни
+  `storage_state/account_N.json`, первый заход нужно сделать руками
+  (`--no-headless`, залогиниться в открывшемся окне, дальше джоб сам
+  сохранит сессию для последующих прогонов).

@@ -1,0 +1,32 @@
+# /etc/systemd/system/refresh-guest-cookies.service
+#
+# ИСПРАВЛЕНО: добавлен User=/Group= — без них systemd запускал процесс
+# от root, а браузеры Playwright стоят в кеше пользователя sashko
+# (/home/sashko/.cache/ms-playwright), root их там не видел:
+#   Executable doesn't exist at /root/.cache/ms-playwright/...
+#
+# Полностью независим от refresh-cookies.service/.timer (реальный логин)
+# и от systemd-юнита/контейнера самого scraper'а — падение одного не
+# влияет на остальные. На слабом хосте см. RandomizedDelaySec в .timer,
+# чтобы два джоба (оба поднимают браузер) не пересеклись по времени.
+
+[Unit]
+Description=Reddit scraper - обновление гостевых (анонимных) cookies (Playwright job)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=sashko
+Group=sashko
+WorkingDirectory=/home/sashko/reddit_scraper
+ExecStart=/home/sashko/reddit_scraper/venv/bin/python3 scripts/refresh_guest_cookies.py
+# Ненулевой exit code (хотя бы один гостевой слот не прошёл верификацию)
+# переводит юнит в failed — видно в
+# `systemctl status refresh-guest-cookies.service` /
+# `journalctl -u refresh-guest-cookies.service`, можно повесить внешний
+# мониторинг.
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,117 @@
+# ============================================================
+#  Общий конфиг скрапера. Перечитывается на лету каждые ~5 сек.
+#
+#  Схема: все аккаунты опрашивают один поток (stream_subs, по умолчанию
+#  r/all) по слотам от единого планировщика. Скорость отправки в пайплайн
+#  регулирует QueueGovernor по состоянию очереди коллектора
+#  (см. секцию queue_control ниже).
+#  Старые секции dedicated_groups / tier_sizing / tier_base_interval_seconds /
+#  adaptive_scheduling / subreddit_ranks_csv больше не используются.
+# ============================================================
+
+# ---- Что опрашиваем ----
+# Список сабов без "r/", склеивается через "+". Только "all" — основной режим.
+stream_subs: ["all"]
+
+reddit_base_url: "https://www.reddit.com"
+
+# Максимум Reddit на страницу — 100 (значения выше игнорируются/ломают выдачу).
+fetch_limit: 100
+
+# ---- Планировщик слотов ----
+# Интервал между опросами ВСЕХ аккаунтов вместе (не на аккаунт!).
+# Дальше подстраивается сам по доле дублей на первой странице.
+stream_start_interval_seconds: 1.5
+stream_min_interval_seconds: 0.4
+stream_max_interval_seconds: 6
+stream_jitter_ratio: 0.2
+
+# Целевая доля дублей на 1-й странице (ewma):
+#   ниже low  -> опрашиваем чаще (рискуем пропустить комментарии)
+#   выше high -> опрашиваем реже (запросы впустую)
+# Если дублей 0 на полной странице — интервал сразу уменьшается (-20%).
+overlap_target_low: 0.25
+overlap_target_high: 0.5
+# Страница короче этого значения не участвует в подстройке.
+full_page_threshold: 90
+
+# ---- Догоняющая пагинация ----
+# Листаем дальше, пока на странице не встретится уже виденный комментарий.
+pagination_max_pages: 5
+pagination_delay_min_seconds: 0.1
+pagination_delay_max_seconds: 0.4
+
+# ---- Свежесть / отправка ----
+max_age_seconds: 120
+
+# СТАТИЧЕСКИЙ лимит отправки в store_items (элементов/сек, на все аккаунты).
+# Используется только как безопасный fallback: когда queue_control.enabled
+# = false, либо когда эндпоинт очереди недоступен дольше stale_seconds.
+target_rate_per_second: 80
+
+# ---- Авто-подстройка скорости по очереди пайплайна ----
+# QueueGovernor раз в poll_interval_seconds читает GET {url} (JSON с
+# bpipe_queue / bpipe_max / upipe_queue / upipe_limit / degraded / action)
+# и сам двигает потолок отправки (TokenBucket) в диапазоне [min_rate, max_rate]:
+#   bpipe_queue < target_min * headroom_ratio -> ускоряемся (x up_factor)
+#   bpipe_queue > target_high                 -> тормозим (x down_factor)
+#   между ними                                -> держим как есть
+#   degraded / очереди почти полные / action=slow* -> резко тормозим
+# Цель: bpipe_queue НЕ ниже target_min (пайплайн не простаивает).
+queue_control:
+  enabled: true
+  url: "http://127.0.0.1:9000/queue"
+  poll_interval_seconds: 1
+  request_timeout_seconds: 2
+
+  # Минимум, ниже которого bpipe_queue опускаться не должна.
+  target_min: 198
+  # Ускоряемся, пока bpipe_queue < target_min * headroom_ratio
+  # (запас, чтобы очередь держалась ВЫШЕ target_min, а не качалась вокруг него).
+  headroom_ratio: 1.10
+  # Выше этого — тормозим. Если не задан: bpipe_max * high_fraction.
+  # target_high: 1000
+  high_fraction: 0.5
+
+  # Границы и стартовое значение потолка отправки (элементов/сек).
+  min_rate: 5
+  max_rate: 400
+  initial_rate: 80
+
+  up_factor: 1.25        # множитель потолка при ускорении (за тик)
+  down_factor: 0.8       # множитель при торможении (от реально отправляемой скорости)
+  panic_factor: 0.5      # множитель при degraded / почти полных очередях
+  panic_fraction: 0.9    # доля заполнения bpipe_max / upipe_limit для паники
+  # Потолок не растёт выше observed * это значение (не уходит в максимум
+  # вхолостую, если Reddit столько не отдаёт).
+  rate_ceiling_over_observed: 2.0
+
+  respect_server_action: true  # action со "slow"/"pause"/"stop" -> тормозим
+  stale_seconds: 30            # столько молчит эндпоинт -> fallback на target_rate_per_second
+  log_every_seconds: 30        # периодическая сводка в лог (смена потолка логируется сразу)
+
+# Дедуп-кэш (в памяти, общий на все аккаунты).
+seen_cache_size: 40000
+
+store_endpoint: "http://127.0.0.1:9000/store_items"
+batch_max_items: 500
+
+user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+
+request_timeout_seconds: 10
+connect_timeout_seconds: 5
+token_wait_timeout_seconds: 0.5
+
+cookie_reload_check_interval_seconds: 30
+
+# ---- Бюджет каждого аккаунта по X-Ratelimit-* ----
+# После ответа аккаунт "отдыхает" reset / (remaining * margin) секунд;
+# в это время планировщик его пропускает.
+respect_ratelimit_headers: true
+ratelimit_safety_margin: 0.85
+ratelimit_max_interval_seconds: 900
+
+# ---- Backoff при ошибках (на аккаунт) ----
+base_backoff_seconds: 5
+max_backoff_seconds: 300
+max_consecutive_auth_errors: 5

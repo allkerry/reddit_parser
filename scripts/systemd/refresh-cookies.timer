@@ -1,0 +1,20 @@
+# scripts/systemd/refresh-cookies.timer
+#
+# Раньше в проекте упоминался (в refresh-cookies.service и README), но
+# самого файла не было — этот .timer его восполняет.
+#
+# Дефолт из README.md ("раз в 7 дней") — реальные логин-cookies живут
+# заметно дольше гостевых (дни/недели, а не часы). Поправь OnCalendar=
+# под то, как часто у тебя реально протухают cookies конкретных
+# аккаунтов.
+
+[Unit]
+Description=Reddit scraper - периодический рефреш логин-cookies
+
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

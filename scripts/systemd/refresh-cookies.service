@@ -1,0 +1,33 @@
+# /etc/systemd/system/refresh-cookies.service
+#
+# ИСПРАВЛЕНО: добавлен User=/Group= — по той же причине, что и у
+# refresh-guest-cookies.service: bundled chromium (без channel) стоит
+# в кеше пользователя sashko, root его не видит.
+#
+# --config указан явно (обходит несостыковку дефолтного пути в самом
+# refresh_cookies.py — по умолчанию он ищет refresh_cookies.yaml в
+# корне проекта, а файл реально лежит в scripts/).
+#
+# Полностью независим от systemd-юнита/контейнера самого scraper'а —
+# падение этого джоба не влияет на account_worker и наоборот.
+
+[Unit]
+Description=Reddit scraper - обновление cookies (Playwright job)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=sashko
+Group=sashko
+WorkingDirectory=/home/sashko/reddit_scraper
+ExecStart=/home/sashko/reddit_scraper/venv/bin/python3 scripts/refresh_cookies.py --config scripts/refresh_cookies.yaml
+# Ненулевой exit code (см. refresh_cookies.py: возвращается 1, если
+# хотя бы один аккаунт требует ручного вмешательства) переводит юнит в
+# failed — это видно в `systemctl status refresh-cookies.service` /
+# `journalctl -u refresh-cookies.service` и может быть повешено на
+# внешний мониторинг (email/telegram-нотификация и т.п.).
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target
